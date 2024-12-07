@@ -1439,8 +1439,8 @@ func applyPatches(executable string, bootPatches []string) (err error) {
 		switch patch {
 		case "rp2040":
 			err = patchRP2040BootCRC(executable)
-		case "rp2350":
-			err = patchRP2350BootIMAGE_DEF(executable)
+		// case "rp2350":
+		// 	err = patchRP2350BootIMAGE_DEF(executable)
 		default:
 			err = errors.New("undefined boot patch name")
 		}
