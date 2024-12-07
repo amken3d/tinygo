@@ -25,7 +25,6 @@ import (
 	"strings"
 
 	"github.com/gofrs/flock"
-	"github.com/soypat/tinyboot/boot/picobin"
 	"github.com/tinygo-org/tinygo/compileopts"
 	"github.com/tinygo-org/tinygo/compiler"
 	"github.com/tinygo-org/tinygo/goenv"
@@ -1488,21 +1487,6 @@ func patchRP2040BootCRC(executable string) error {
 
 	// Update the .boot2 section to included the CRC
 	return replaceElfSection(executable, ".boot2", bytes)
-}
-
-// RP2350 block patching.
-func patchRP2350BootIMAGE_DEF(executable string) error {
-	boot2, _, err := getElfSectionData(executable, ".boot2")
-	if err != nil {
-		return err
-	}
-	item0 := picobin.MakeImageDef(picobin.ImageTypeExecutable, picobin.ExeSecSecure, picobin.ExeCPUARM, picobin.ExeChipRP2350, false)
-	newBoot := make([]byte, 256)
-	newBoot, _, err = picobin.AppendBlockFromItems(newBoot[:0], []picobin.Item{item0.Item}, boot2, 0)
-	off := len(newBoot)
-	newBoot, _, err = picobin.AppendFinalBlock(newBoot, -off)
-	// Update the .boot2 section to included the CRC
-	return replaceElfSection(executable, ".boot2", newBoot)
 }
 
 // lock may acquire a lock at the specified path.
