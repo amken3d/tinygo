@@ -1636,6 +1636,14 @@ func main() {
 	monitor := flag.Bool("monitor", false, "enable serial monitor")
 	baudrate := flag.Int("baudrate", 115200, "baudrate of serial monitor")
 	gocompatibility := flag.Bool("go-compatibility", true, "enable to check for Go versions compatibility, you can also configure this by setting the TINYGO_GOCOMPATIBILITY environment variable")
+	// Safety analysis flags for MISRA-Go compliance
+	safetyLevel := flag.String("safety", "", "safety analysis level (none, standard, enhanced, strict)")
+	safetyFormat := flag.String("safety-format", "text", "safety report format (text, json, sarif)")
+	safetyOutput := flag.String("safety-output", "", "output file for safety report (default: stderr)")
+	safetyStrict := flag.Bool("safety-strict", false, "treat safety warnings as errors")
+	safetyComplexity := flag.Int("safety-complexity", 10, "maximum cyclomatic complexity threshold")
+	safetyNesting := flag.Int("safety-nesting", 4, "maximum nesting depth threshold")
+	safetyDisable := flag.String("safety-disable", "", "comma-separated list of rules to disable")
 
 	// Internal flags, that are only intended for TinyGo development.
 	printIR := flag.Bool("internal-printir", false, "print LLVM IR")
@@ -1712,6 +1720,11 @@ func main() {
 	if *ocdCommandsString != "" {
 		ocdCommands = strings.Split(*ocdCommandsString, ",")
 	}
+	// Parse safety disabled rules
+	var safetyDisabledRules []string
+	if *safetyDisable != "" {
+		safetyDisabledRules = strings.Split(*safetyDisable, ",")
+	}
 
 	val, ok := os.LookupEnv("TINYGO_GOCOMPATIBILITY")
 	if ok {
@@ -1760,6 +1773,15 @@ func main() {
 		WITPackage:      witPackage,
 		WITWorld:        witWorld,
 		GoCompatibility: *gocompatibility,
+		Safety: compileopts.SafetyOptions{
+			Level:                 *safetyLevel,
+			OutputFormat:          *safetyFormat,
+			OutputFile:            *safetyOutput,
+			TreatWarningsAsErrors: *safetyStrict,
+			ComplexityThreshold:   *safetyComplexity,
+			NestingThreshold:      *safetyNesting,
+			DisabledRules:         safetyDisabledRules,
+		},
 	}
 	if *printCommands {
 		options.PrintCommands = printCommand

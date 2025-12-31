@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/gofrs/flock"
+	"github.com/tinygo-org/tinygo/analysis/misra"
 	"github.com/tinygo-org/tinygo/compileopts"
 	"github.com/tinygo-org/tinygo/compiler"
 	"github.com/tinygo-org/tinygo/goenv"
@@ -31,6 +32,7 @@ import (
 	"github.com/tinygo-org/tinygo/loader"
 	"github.com/tinygo-org/tinygo/stacksize"
 	"github.com/tinygo-org/tinygo/transform"
+	"golang.org/x/tools/go/ssa"
 	"tinygo.org/x/go-llvm"
 )
 
@@ -257,6 +259,12 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 	// Create the *ssa.Program. This does not yet build the entire SSA of the
 	// program so it's pretty fast and doesn't need to be parallelized.
 	program := lprogram.LoadSSA()
+	// Run MISRA-Go safety analysis if enabled.
+	if config.SafetyEnabled() {
+		if err := runSafetyAnalysis(config, lprogram, program); err != nil {
+			return result, err
+		}
+	}
 
 	// Add jobs to compile each package.
 	// Packages that have a cache hit will not be compiled again.
@@ -1547,4 +1555,55 @@ func b2u8(b bool) uint8 {
 		return 1
 	}
 	return 0
+}
+
+// runSafetyAnalysis performs MISRA-Go safety analysis on the loaded program.
+// It analyzes all packages and reports violations according to the configured
+// safety level. Returns an error if the build should fail due to violations.
+func runSafetyAnalysis(config *compileopts.Config, lprogram *loader.Program, program *ssa.Program) error {
+	var allViolations []misra.Violation
+	shouldFail := false
+
+	// Analyze each package
+	for _, pkg := range lprogram.Sorted() {
+		// Skip standard library packages unless in strict mode
+		if config.SafetyLevel() != "strict" {
+			// Skip packages that look like standard library
+			if !strings.Contains(pkg.ImportPath, ".") && !strings.HasPrefix(pkg.ImportPath, "main") {
+				continue
+			}
+		}
+
+		// Get the SSA package if available
+		var ssaPkg *ssa.Package
+		if program != nil {
+			ssaPkg = program.Package(pkg.Pkg)
+			if ssaPkg != nil {
+				ssaPkg.Build()
+			}
+		}
+
+		// Run analysis
+		violations, fail := misra.RunAnalysis(
+			config,
+			lprogram.FileSet(),
+			pkg.Pkg,
+			pkg.TypesInfo(),
+			pkg.Files,
+			ssaPkg,
+		)
+
+		allViolations = append(allViolations, violations...)
+		if fail {
+			shouldFail = true
+		}
+	}
+
+	if shouldFail {
+		return &MultiError{
+			Errs: []error{errors.New("safety analysis failed: mandatory violations found")},
+		}
+	}
+
+	return nil
 }

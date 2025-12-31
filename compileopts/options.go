@@ -59,7 +59,8 @@ type Options struct {
 	WITPackage      string // pass through to wasm-tools component embed invocation
 	WITWorld        string // pass through to wasm-tools component embed -w option
 	ExtLDFlags      []string
-	GoCompatibility bool // enable to check for Go version compatibility
+	GoCompatibility bool          // enable to check for Go version compatibility
+	Safety          SafetyOptions // MISRA-Go safety analysis options
 }
 
 // Verify performs a validation on the given options, raising an error if options are not valid.
@@ -121,6 +122,11 @@ func (o *Options) Verify() error {
 		if !isInArray(validOptOptions, o.Opt) {
 			return fmt.Errorf("invalid -opt=%s: valid values are %s", o.Opt, strings.Join(validOptOptions, ", "))
 		}
+	}
+
+	// Validate safety options
+	if err := o.Safety.Validate(); err != nil {
+		return err
 	}
 
 	return nil

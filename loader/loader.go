@@ -304,6 +304,16 @@ func (p *Program) Sorted() []*Package {
 	return p.sorted
 }
 
+// FileSet returns the token.FileSet used for parsing.
+func (p *Program) FileSet() *token.FileSet {
+	return p.fset
+}
+
+// TypesInfo returns the types.Info for this package.
+func (pkg *Package) TypesInfo() *types.Info {
+	return &pkg.info
+}
+
 // MainPkg returns the last package in the Sorted() slice. This is the main
 // package of the program.
 func (p *Program) MainPkg() *Package {
