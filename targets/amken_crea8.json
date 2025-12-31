@@ -1,0 +1,8 @@
+{
+  "inherits": [
+    "rp2350b"
+  ],
+  "build-tags": ["crea8"],
+  "serial-port": ["2e8a:10ee"],
+  "default-stack-size": 32768
+}
