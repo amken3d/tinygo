@@ -378,7 +378,16 @@ func readSVD(path, sourceURL string) (*Device, error) {
 			}
 		}
 
-		if _, ok := groups[groupName]; ok || periphEl.DerivedFrom != "" {
+		// Only derive from an existing group if:
+		// 1. There's an explicit derivedFrom attribute, OR
+		// 2. The groupName matches AND the peripheral has NO registers/clusters of its own
+		// This fixes issue #5154 where peripherals with the same groupName but different
+		// registers were incorrectly merged into a single type.
+		hasOwnRegisters := len(periphEl.Registers) > 0 || len(periphEl.Clusters) > 0
+		_, groupExists := groups[groupName]
+		shouldDerive := periphEl.DerivedFrom != "" || (groupExists && !hasOwnRegisters)
+
+		if shouldDerive {
 			var derivedFrom *Peripheral
 			if periphEl.DerivedFrom != "" {
 				derivedFrom = peripheralDict[periphEl.DerivedFrom]
@@ -408,6 +417,12 @@ func readSVD(path, sourceURL string) (*Device, error) {
 				})
 			}
 			continue
+		}
+
+		// If the groupName is already taken by a different peripheral with its own
+		// registers, use the peripheral name as the groupName to avoid type conflicts.
+		if groupExists && hasOwnRegisters {
+			groupName = cleanName(periphEl.Name)
 		}
 
 		p := &Peripheral{
