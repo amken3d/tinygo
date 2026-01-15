@@ -1,4 +1,4 @@
-//go:build stm32l4 || stm32l5
+//go:build stm32l4 || stm32l5 || stm32g4
 
 package machine
 
@@ -76,4 +76,17 @@ func (p Pin) SetInterrupt(change PinChange, callback func(Pin)) error {
 	intr.Enable()
 
 	return nil
+}
+
+func handlePinInterrupt(pin uint8) {
+	if stm32.EXTI.PR1.HasBits(1 << pin) {
+		// Writing 1 to the pending register clears the
+		// pending flag for that bit
+		stm32.EXTI.PR1.Set(1 << pin)
+
+		callback := pinCallbacks[pin]
+		if callback != nil {
+			callback(interruptPins[pin])
+		}
+	}
 }

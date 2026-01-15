@@ -1,0 +1,10 @@
+{
+    "inherits": ["cortex-m4"],
+    "build-tags": ["stm32g431xx", "stm32g4", "stm32"],
+    "linkerscript": "targets/stm32g431.ld",
+    "extra-files": [
+        "src/device/stm32/stm32g431xx.s"
+    ],
+    "flash-method": "openocd",
+    "openocd-target": "stm32g4x"
+}

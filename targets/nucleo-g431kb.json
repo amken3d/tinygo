@@ -1,0 +1,6 @@
+{
+    "inherits": ["stm32g431"],
+    "build-tags": ["nucleog431kb"],
+    "serial": "uart",
+    "openocd-interface": "stlink"
+}
