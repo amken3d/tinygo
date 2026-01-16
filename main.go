@@ -1345,6 +1345,22 @@ normally needed.`
 If one or more variable names are given as arguments, env prints the value of
 each on a new line.`
 
+	usageExternal = `Manage external machine packages. External packages allow chip families
+and boards to be maintained separately from mainline TinyGo.
+
+Subcommands:
+	tinygo external list      - List configured external packages
+	tinygo external validate  - Validate external package structure
+	tinygo external info      - Show details about an external package
+
+Environment:
+	TINYGO_EXTERNAL_PACKAGES  - Colon-separated list of external package paths
+
+Example:
+	export TINYGO_EXTERNAL_PACKAGES=/path/to/my-chip-support
+	tinygo external list
+	tinygo build -target myboard main.go`
+
 	usageDefault = `TinyGo is a Go compiler for small places.
 version: %s
 usage: %s <command> [arguments]
@@ -1362,21 +1378,23 @@ commands:
 		clean:		empty cache directory (%s)
 		targets:	list targets
 		info:		show info for specified target
+		external:	manage external machine packages
 		version:	show version
 		help:		print this help text`
 )
 
 var (
 	commandHelp = map[string]string{
-		"build":   usageBuild,
-		"run":     usageRun,
-		"flash":   usageFlash,
-		"monitor": usageMonitor,
-		"gdb":     usageGdb,
-		"clean":   usageClean,
-		"help":    usageHelp,
-		"version": usageVersion,
-		"env":     usageEnv,
+		"build":    usageBuild,
+		"run":      usageRun,
+		"flash":    usageFlash,
+		"monitor":  usageMonitor,
+		"gdb":      usageGdb,
+		"clean":    usageClean,
+		"help":     usageHelp,
+		"version":  usageVersion,
+		"env":      usageEnv,
+		"external": usageExternal,
 	}
 )
 
@@ -1405,6 +1423,23 @@ func handleCompilerError(err error) {
 		diagnostics.CreateDiagnostics(err).WriteTo(os.Stderr, wd)
 		os.Exit(1)
 	}
+}
+
+// countTargetFiles counts the number of target JSON files in the given directories.
+func countTargetFiles(dirs []string) int {
+	count := 0
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+				count++
+			}
+		}
+	}
+	return count
 }
 
 // This is a special type for the -X flag to parse the pkgpath.Var=stringVal
@@ -1945,6 +1980,177 @@ func main() {
 			for i := 0; i < flag.NArg(); i++ {
 				fmt.Println(goenv.Get(flag.Arg(i)))
 			}
+		}
+	case "external":
+		// Handle external package commands
+		subcommand := "list"
+		if flag.NArg() >= 1 {
+			subcommand = flag.Arg(0)
+		}
+		switch subcommand {
+		case "list":
+			// List all configured external packages
+			extPkgs, err := compileopts.GetExternalPackages()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "error loading external packages:", err)
+				os.Exit(1)
+			}
+			if len(extPkgs) == 0 {
+				fmt.Println("No external packages configured.")
+				fmt.Println("Set TINYGO_EXTERNAL_PACKAGES environment variable to configure external packages.")
+			} else {
+				fmt.Printf("External packages (%d):\n\n", len(extPkgs))
+				for _, pkg := range extPkgs {
+					fmt.Printf("  %s\n", pkg.Manifest.Name)
+					fmt.Printf("    Path:        %s\n", pkg.Path)
+					if pkg.Manifest.Description != "" {
+						fmt.Printf("    Description: %s\n", pkg.Manifest.Description)
+					}
+					if len(pkg.Manifest.ChipFamilies) > 0 {
+						fmt.Printf("    Chip families: %s\n", strings.Join(pkg.Manifest.ChipFamilies, ", "))
+					}
+					if len(pkg.ResolvedTargetDirs) > 0 {
+						fmt.Printf("    Targets:     %d target(s) available\n", countTargetFiles(pkg.ResolvedTargetDirs))
+					}
+					fmt.Println()
+				}
+			}
+		case "validate":
+			// Validate external package(s)
+			var paths []string
+			if flag.NArg() >= 2 {
+				paths = flag.Args()[1:]
+			} else {
+				// Validate all configured packages
+				extPkgs, err := compileopts.GetExternalPackages()
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "error loading external packages:", err)
+					os.Exit(1)
+				}
+				for _, pkg := range extPkgs {
+					paths = append(paths, pkg.Path)
+				}
+			}
+			if len(paths) == 0 {
+				fmt.Println("No packages to validate. Specify a path or set TINYGO_EXTERNAL_PACKAGES.")
+				os.Exit(1)
+			}
+			allValid := true
+			for _, path := range paths {
+				fmt.Printf("Validating: %s\n", path)
+				pkg, err := compileopts.LoadExternalPackage(path)
+				if err != nil {
+					fmt.Printf("  ✗ Failed to load: %v\n", err)
+					allValid = false
+					continue
+				}
+				fmt.Printf("  ✓ Manifest valid (name: %s)\n", pkg.Manifest.Name)
+				if len(pkg.ResolvedTargetDirs) > 0 {
+					fmt.Printf("  ✓ Target directory found\n")
+				} else {
+					fmt.Printf("  ⚠ No target directory found\n")
+				}
+				if len(pkg.ResolvedMachineDirs) > 0 {
+					fmt.Printf("  ✓ Machine package directory found\n")
+				} else {
+					fmt.Printf("  ⚠ No machine package directory found\n")
+				}
+				if len(pkg.ResolvedDeviceDirs) > 0 {
+					fmt.Printf("  ✓ Device package directory found\n")
+				} else {
+					fmt.Printf("  ⚠ No device package directory found\n")
+				}
+				fmt.Println()
+			}
+			if !allValid {
+				os.Exit(1)
+			}
+		case "info":
+			// Show detailed info about a specific package
+			if flag.NArg() < 2 {
+				fmt.Println("Usage: tinygo external info <package-path-or-name>")
+				os.Exit(1)
+			}
+			pkgArg := flag.Arg(1)
+			var pkg *compileopts.ExternalPackage
+			var err error
+
+			// Try to load by path first
+			if _, statErr := os.Stat(pkgArg); statErr == nil {
+				loaded, loadErr := compileopts.LoadExternalPackage(pkgArg)
+				if loadErr != nil {
+					fmt.Fprintln(os.Stderr, "error loading package:", loadErr)
+					os.Exit(1)
+				}
+				pkg = &loaded
+			} else {
+				// Try to find by namespace
+				pkg, err = compileopts.GetExternalPackageByNamespace(pkgArg)
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "error finding package:", err)
+					os.Exit(1)
+				}
+				if pkg == nil {
+					fmt.Fprintf(os.Stderr, "package %q not found\n", pkgArg)
+					os.Exit(1)
+				}
+			}
+
+			// Print detailed info
+			fmt.Printf("Package: %s\n", pkg.Manifest.Name)
+			fmt.Printf("Namespace: %s\n", pkg.Namespace())
+			fmt.Printf("Path: %s\n", pkg.Path)
+			if pkg.Manifest.Description != "" {
+				fmt.Printf("Description: %s\n", pkg.Manifest.Description)
+			}
+			if pkg.Manifest.Author != "" {
+				fmt.Printf("Author: %s\n", pkg.Manifest.Author)
+			}
+			if pkg.Manifest.License != "" {
+				fmt.Printf("License: %s\n", pkg.Manifest.License)
+			}
+			if len(pkg.Manifest.ChipFamilies) > 0 {
+				fmt.Printf("Chip Families: %s\n", strings.Join(pkg.Manifest.ChipFamilies, ", "))
+			}
+
+			// List targets
+			if len(pkg.ResolvedTargetDirs) > 0 {
+				fmt.Println("\nTargets:")
+				for _, dir := range pkg.ResolvedTargetDirs {
+					entries, _ := os.ReadDir(dir)
+					for _, e := range entries {
+						if !e.IsDir() && strings.HasSuffix(e.Name(), ".json") {
+							name := strings.TrimSuffix(e.Name(), ".json")
+							fmt.Printf("  - %s\n", name)
+						}
+					}
+				}
+			}
+
+			// Peripheral status
+			if len(pkg.Manifest.PeripheralStatus) > 0 {
+				fmt.Println("\nPeripheral Status:")
+				for name, status := range pkg.Manifest.PeripheralStatus {
+					tierStr := ""
+					switch status.TestTier {
+					case 0:
+						tierStr = "compiles"
+					case 1:
+						tierStr = "smoke tested"
+					case 2:
+						tierStr = "loopback verified"
+					case 3:
+						tierStr = "integration verified"
+					case 4:
+						tierStr = "application verified"
+					}
+					fmt.Printf("  %s: %s (tier %d: %s)\n", name, status.Status, status.TestTier, tierStr)
+				}
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "Unknown external subcommand: %s\n", subcommand)
+			fmt.Fprintln(os.Stderr, "Valid subcommands: list, validate, info")
+			os.Exit(1)
 		}
 	default:
 		fmt.Fprintln(os.Stderr, "Unknown command:", command)

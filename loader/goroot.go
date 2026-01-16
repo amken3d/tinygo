@@ -54,7 +54,23 @@ func GetCachedGoroot(config *compileopts.Config) (string, error) {
 	}
 
 	// Hash the merge links to create a cache key.
-	data, err := json.Marshal(merge)
+	// Also include external package paths in the hash so that the GOROOT
+	// is rebuilt when external packages change.
+	hashData := struct {
+		Merge    map[string]string
+		ExtPkgs  []string
+		ExtPaths string
+	}{
+		Merge: merge,
+	}
+	extPkgs, _ := compileopts.GetExternalPackages()
+	for _, pkg := range extPkgs {
+		hashData.ExtPkgs = append(hashData.ExtPkgs, pkg.Path)
+	}
+	// Include TINYGO_EXTERNAL_PACKAGES env var directly for cache invalidation
+	hashData.ExtPaths = os.Getenv("TINYGO_EXTERNAL_PACKAGES")
+
+	data, err := json.Marshal(hashData)
 	if err != nil {
 		return "", err
 	}
@@ -211,7 +227,99 @@ func listGorootMergeLinks(goroot, tinygoroot string, overrides map[string]bool) 
 		merges["go.env"] = filepath.Join(goroot, "go.env")
 	}
 
+	// Add files from external packages (machine and device packages).
+	if err := addExternalPackageMerges(merges); err != nil {
+		return nil, err
+	}
+
 	return merges, nil
+}
+
+// addExternalPackageMerges adds symlinks for external machine and device packages.
+// External package files are added alongside built-in TinyGo machine/device files.
+// The Go build system will filter based on build tags.
+func addExternalPackageMerges(merges map[string]string) error {
+	extPkgs, err := compileopts.GetExternalPackages()
+	if err != nil {
+		return err
+	}
+
+	for i := range extPkgs {
+		pkg := &extPkgs[i]
+
+		// Add machine package files from external package
+		for _, machineDir := range pkg.ResolvedMachineDirs {
+			entries, err := os.ReadDir(machineDir)
+			if err != nil {
+				continue // Skip directories that can't be read
+			}
+
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				name := e.Name()
+				// Only include .go and .s files
+				if !isSourceFile(name) {
+					continue
+				}
+
+				// Create a unique name to avoid collisions with built-in files.
+				// Prefix with package namespace.
+				// However, for machine package, all files must be in the same
+				// package, so we use a prefix that won't collide.
+				uniqueName := "external_" + pkg.Namespace() + "_" + name
+				dstPath := filepath.Join("src", "machine", uniqueName)
+
+				// Don't override existing files
+				if _, exists := merges[dstPath]; !exists {
+					merges[dstPath] = filepath.Join(machineDir, name)
+				}
+			}
+		}
+
+		// Add device package files from external package
+		for _, deviceDir := range pkg.ResolvedDeviceDirs {
+			// Get the device package name (last component of path)
+			devicePkgName := filepath.Base(deviceDir)
+
+			entries, err := os.ReadDir(deviceDir)
+			if err != nil {
+				continue
+			}
+
+			for _, e := range entries {
+				if e.IsDir() {
+					// Create symlink for subdirectory
+					subdir := e.Name()
+					dstPath := filepath.Join("src", "device", devicePkgName, subdir)
+					if _, exists := merges[dstPath]; !exists {
+						merges[dstPath] = filepath.Join(deviceDir, subdir)
+					}
+					continue
+				}
+
+				name := e.Name()
+				if !isSourceFile(name) {
+					continue
+				}
+
+				dstPath := filepath.Join("src", "device", devicePkgName, name)
+				if _, exists := merges[dstPath]; !exists {
+					merges[dstPath] = filepath.Join(deviceDir, name)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// isSourceFile returns true if the filename is a Go source file or assembly file.
+func isSourceFile(name string) bool {
+	return filepath.Ext(name) == ".go" ||
+		filepath.Ext(name) == ".s" ||
+		filepath.Ext(name) == ".S"
 }
 
 // needsSyscallPackage returns whether the syscall package should be overridden

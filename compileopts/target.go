@@ -67,6 +67,10 @@ type TargetSpec struct {
 	RelocationModel  string   `json:"relocation-model,omitempty"`
 	WITPackage       string   `json:"wit-package,omitempty"`
 	WITWorld         string   `json:"wit-world,omitempty"`
+
+	// ExternalPackage is set when this target comes from an external package.
+	// It is used to resolve paths like ${PACKAGE_ROOT} in linker scripts and extra files.
+	ExternalPackage *ExternalPackage `json:"-"`
 }
 
 // overrideProperties overrides all properties that are set in child into itself using reflection.
@@ -182,18 +186,41 @@ func LoadTarget(options *Options) (*TargetSpec, error) {
 		return defaultTarget(options)
 	}
 
-	// See whether there is a target specification for this target (e.g.
-	// Arduino).
 	spec := &TargetSpec{}
-	err := spec.loadFromGivenStr(options.Target)
-	if err != nil {
-		return nil, err
+	var err error
+
+	// First, try to find the target in external packages
+	extPkg, extPath, extErr := FindExternalTarget(options.Target)
+	if extErr != nil {
+		// Ambiguous target name or other error
+		return nil, extErr
 	}
-	// Successfully loaded this target from a built-in .json file. Make sure
-	// it includes all parents as specified in the "inherits" key.
+
+	if extPkg != nil && extPath != "" {
+		// Found in external package - load from there
+		err = spec.loadFromFile(extPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load external target %s: %w", options.Target, err)
+		}
+		spec.ExternalPackage = extPkg
+	} else {
+		// Not found in external packages, try built-in targets
+		err = spec.loadFromGivenStr(options.Target)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Successfully loaded this target. Make sure it includes all parents
+	// as specified in the "inherits" key.
 	err = spec.resolveInherits()
 	if err != nil {
 		return nil, fmt.Errorf("%s : %w", options.Target, err)
+	}
+
+	// Resolve any ${PACKAGE_ROOT} paths in the target spec
+	if spec.ExternalPackage != nil {
+		spec.resolvePaths()
 	}
 
 	if spec.Scheduler == "asyncify" {
@@ -203,17 +230,62 @@ func LoadTarget(options *Options) (*TargetSpec, error) {
 	return spec, nil
 }
 
+// loadFromFile loads a target specification from a file path.
+func (spec *TargetSpec) loadFromFile(path string) error {
+	fp, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer fp.Close()
+	return spec.load(fp)
+}
+
+// resolvePaths resolves ${PACKAGE_ROOT} in paths when the target comes from
+// an external package.
+func (spec *TargetSpec) resolvePaths() {
+	if spec.ExternalPackage == nil {
+		return
+	}
+
+	packageRoot := spec.ExternalPackage.Path
+
+	// Resolve linker script path
+	if spec.LinkerScript != "" {
+		spec.LinkerScript = resolveExternalPath(packageRoot, spec.LinkerScript)
+	}
+
+	// Resolve extra files paths
+	for i, f := range spec.ExtraFiles {
+		spec.ExtraFiles[i] = resolveExternalPath(packageRoot, f)
+	}
+
+	// Resolve boot patches paths
+	for i, f := range spec.BootPatches {
+		spec.BootPatches[i] = resolveExternalPath(packageRoot, f)
+	}
+}
+
+// resolveExternalPath resolves a path that may contain ${PACKAGE_ROOT}.
+func resolveExternalPath(packageRoot, path string) string {
+	if strings.Contains(path, "${PACKAGE_ROOT}") {
+		return strings.ReplaceAll(path, "${PACKAGE_ROOT}", packageRoot)
+	}
+	return path
+}
+
 // GetTargetSpecs retrieves target specifications from the TINYGOROOT targets
-// directory.  Only valid target JSON files are considered, and the function
-// returns a map of target names to their respective TargetSpec.
+// directory and external packages. Only valid target JSON files are considered,
+// and the function returns a map of target names to their respective TargetSpec.
 func GetTargetSpecs() (map[string]*TargetSpec, error) {
+	maps := map[string]*TargetSpec{}
+
+	// Load built-in targets
 	dir := filepath.Join(goenv.Get("TINYGOROOT"), "targets")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("could not list targets: %w", err)
 	}
 
-	maps := map[string]*TargetSpec{}
 	for _, entry := range entries {
 		entryInfo, err := entry.Info()
 		if err != nil {
@@ -237,6 +309,57 @@ func GetTargetSpecs() (map[string]*TargetSpec, error) {
 		name = name[:len(name)-5]
 		maps[name] = spec
 	}
+
+	// Load targets from external packages
+	extPkgs, err := GetExternalPackages()
+	if err != nil {
+		return nil, fmt.Errorf("could not load external packages: %w", err)
+	}
+
+	for i := range extPkgs {
+		pkg := &extPkgs[i]
+		for _, targetDir := range pkg.ResolvedTargetDirs {
+			entries, err := os.ReadDir(targetDir)
+			if err != nil {
+				continue // Skip directories that can't be read
+			}
+
+			for _, entry := range entries {
+				if !entry.Type().IsRegular() || !strings.HasSuffix(entry.Name(), ".json") {
+					continue
+				}
+
+				name := entry.Name()
+				name = name[:len(name)-5]
+
+				// Use qualified name if there's a collision
+				qualifiedName := pkg.Namespace() + "/" + name
+				if _, exists := maps[name]; exists {
+					// Collision with built-in or another external target
+					// Use qualified name
+					name = qualifiedName
+				}
+
+				path := filepath.Join(targetDir, entry.Name())
+				spec, err := LoadTarget(&Options{Target: path})
+				if err != nil {
+					continue // Skip invalid targets
+				}
+				if spec.FlashMethod == "" && spec.FlashCommand == "" && spec.Emulator == "" {
+					// Parent target, skip
+					continue
+				}
+				spec.ExternalPackage = pkg
+				maps[name] = spec
+
+				// Also add qualified name for unambiguous access
+				if name != qualifiedName {
+					maps[qualifiedName] = spec
+				}
+			}
+		}
+	}
+
 	return maps, nil
 }
 
