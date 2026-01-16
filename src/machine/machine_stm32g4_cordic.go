@@ -446,32 +446,35 @@ func (c *CORDIC) Atanh(x float32) float32 {
 // Input angle should already be divided by π (range [-1, 1] = [-π, π])
 // Returns sin(θ*π) in q1.31 format
 func (c *CORDIC) SinQ31(angleQ31 int32) int32 {
-	c.Configure(CordicConfig{
+	c.ConfigureTwoArgs(CordicConfig{
 		Function:  CordicFuncSine,
 		Precision: CordicPrecision20Iter,
 		Scale:     0,
 	})
-	return c.Calculate(angleQ31)
+	// Write angle and modulus (1.0 = Q31Max)
+	return c.Calculate2Args(angleQ31, Q31Max)
 }
 
 // CosQ31 computes cosine using q1.31 fixed-point directly
 func (c *CORDIC) CosQ31(angleQ31 int32) int32 {
-	c.Configure(CordicConfig{
+	c.ConfigureTwoArgs(CordicConfig{
 		Function:  CordicFuncCosine,
 		Precision: CordicPrecision20Iter,
 		Scale:     0,
 	})
-	return c.Calculate(angleQ31)
+	// Write angle and modulus (1.0 = Q31Max)
+	return c.Calculate2Args(angleQ31, Q31Max)
 }
 
 // SinCosQ31 computes both sine and cosine in q1.31 format
 func (c *CORDIC) SinCosQ31(angleQ31 int32) (sinQ31, cosQ31 int32) {
-	c.ConfigureTwoResults(CordicConfig{
+	c.ConfigureTwoArgsResults(CordicConfig{
 		Function:  CordicFuncSine,
 		Precision: CordicPrecision20Iter,
 		Scale:     0,
 	})
-	return c.Calculate2Results(angleQ31)
+	// Write angle and modulus (1.0 = Q31Max)
+	return c.Calculate2Args2Results(angleQ31, Q31Max)
 }
 
 // Atan2Q31 computes atan2(y,x) in q1.31 format

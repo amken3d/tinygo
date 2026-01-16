@@ -24,88 +24,15 @@ func CPUFrequency() uint32 {
 // Unique device ID (96 bits)
 var deviceIDAddr = []uintptr{0x1FFF7590, 0x1FFF7594, 0x1FFF7598}
 
-// Alternate function constants for STM32G4
-// Reference: STM32G431xx datasheet, Table 13. Alternate function mapping
+// Alternate function numbers - these are the raw AF values from the datasheet
+// Pin-specific mappings are in machine_stm32g4_altfunc.go
 const (
-	AF0_SYSTEM                              = 0
-	AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1          = 1
-	AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15 = 2
-	AF3_TIM8_SAI1_COMP                      = 3
-	AF4_I2C1_I2C2_I2C3_I2C4                 = 4
-	AF5_SPI1_SPI2_I2S2_I2S3                 = 5
-	AF6_SPI2_SPI3_I2S2_I2S3                 = 6
-	AF7_USART1_USART2_USART3                = 7
-	AF8_COMP_LPUART1                        = 8
-	AF9_FDCAN1_TIM1_TIM8_TIM15              = 9
-	AF10_USB_TIM2_TIM3_TIM4_TIM8_TIM17      = 10
-	AF11_TIM1_TIM8_LPTIM1                   = 11
-	AF12_TIM1_COMP_FDCAN1_SAI1              = 12
-	AF13_SAI1_OPAMP                         = 13
-	AF14_TIM2_TIM15_TIM16_TIM17_UCPD1       = 14
-	AF15_EVENTOUT                           = 15
-)
-
-// GPIO pin definitions
-const (
-	PA0  = portA + 0
-	PA1  = portA + 1
-	PA2  = portA + 2
-	PA3  = portA + 3
-	PA4  = portA + 4
-	PA5  = portA + 5
-	PA6  = portA + 6
-	PA7  = portA + 7
-	PA8  = portA + 8
-	PA9  = portA + 9
-	PA10 = portA + 10
-	PA11 = portA + 11
-	PA12 = portA + 12
-	PA13 = portA + 13
-	PA14 = portA + 14
-	PA15 = portA + 15
-
-	PB0  = portB + 0
-	PB1  = portB + 1
-	PB2  = portB + 2
-	PB3  = portB + 3
-	PB4  = portB + 4
-	PB5  = portB + 5
-	PB6  = portB + 6
-	PB7  = portB + 7
-	PB8  = portB + 8
-	PB9  = portB + 9
-	PB10 = portB + 10
-	PB11 = portB + 11
-	PB12 = portB + 12
-	PB13 = portB + 13
-	PB14 = portB + 14
-	PB15 = portB + 15
-
-	PC0  = portC + 0
-	PC1  = portC + 1
-	PC2  = portC + 2
-	PC3  = portC + 3
-	PC4  = portC + 4
-	PC5  = portC + 5
-	PC6  = portC + 6
-	PC7  = portC + 7
-	PC8  = portC + 8
-	PC9  = portC + 9
-	PC10 = portC + 10
-	PC11 = portC + 11
-	PC12 = portC + 12
-	PC13 = portC + 13
-	PC14 = portC + 14
-	PC15 = portC + 15
-
-	PD0 = portD + 0
-	PD1 = portD + 1
-	PD2 = portD + 2
-
-	PF0 = portF + 0
-	PF1 = portF + 1
-
-	PG10 = portG + 10
+	AF_TIM2  = 1 // TIM2 on PA0-PA3, PA5, PA15, PB3, PB10, PB11
+	AF_TIM3  = 2 // TIM3 on PA6, PA7, PB0, PB1, PB4, PB5
+	AF_TIM4  = 2 // TIM4 on PB6-PB9
+	AF_TIM1  = 6 // TIM1 on PA8-PA11
+	AF_TIM15 = 9 // TIM15 on PA2, PA3
+	AF_TIM16 = 1 // TIM16 on PA6, PB8
 )
 
 // IRQ constants for timers
@@ -362,16 +289,16 @@ var (
 		Device:         stm32.TIM1,
 		Channels: [4]TimerChannel{
 			TimerChannel{Pins: []PinFunction{
-				{PA8, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA8, AF_TIM1}, // TIM1_CH1
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA9, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA9, AF_TIM1}, // TIM1_CH2
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA10, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA10, AF_TIM1}, // TIM1_CH3
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA11, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA11, AF_TIM1}, // TIM1_CH4
 			}},
 		},
 		busFreq: APB2_TIM_FREQ,
@@ -383,21 +310,21 @@ var (
 		Device:         stm32.TIM2,
 		Channels: [4]TimerChannel{
 			TimerChannel{Pins: []PinFunction{
-				{PA0, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
-				{PA5, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
-				{PA15, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA0, AF_TIM2},
+				{PA5, AF_TIM2},
+				{PA15, AF_TIM2},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA1, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
-				{PB3, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA1, AF_TIM2},
+				{PB3, AF_TIM2},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA2, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
-				{PB10, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA2, AF_TIM2},
+				{PB10, AF_TIM2},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA3, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
-				{PB11, AF1_TIM1_TIM2_TIM5_TIM8_LPTIM1},
+				{PA3, AF_TIM2},
+				{PB11, AF_TIM2},
 			}},
 		},
 		busFreq: APB1_TIM_FREQ,
@@ -409,18 +336,18 @@ var (
 		Device:         stm32.TIM3,
 		Channels: [4]TimerChannel{
 			TimerChannel{Pins: []PinFunction{
-				{PA6, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
-				{PB4, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PA6, AF_TIM3},
+				{PB4, AF_TIM3},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA7, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
-				{PB5, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PA7, AF_TIM3},
+				{PB5, AF_TIM3},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PB0, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PB0, AF_TIM3},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PB1, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PB1, AF_TIM3},
 			}},
 		},
 		busFreq: APB1_TIM_FREQ,
@@ -432,16 +359,16 @@ var (
 		Device:         stm32.TIM4,
 		Channels: [4]TimerChannel{
 			TimerChannel{Pins: []PinFunction{
-				{PB6, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PB6, AF_TIM4},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PB7, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PB7, AF_TIM4},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PB8, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PB8, AF_TIM4},
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PB9, AF2_TIM1_TIM2_TIM3_TIM4_TIM5_TIM8_TIM15},
+				{PB9, AF_TIM4},
 			}},
 		},
 		busFreq: APB1_TIM_FREQ,
@@ -492,10 +419,10 @@ var (
 		Device:         stm32.TIM15,
 		Channels: [4]TimerChannel{
 			TimerChannel{Pins: []PinFunction{
-				{PA2, AF14_TIM2_TIM15_TIM16_TIM17_UCPD1},
+				{PA2, AF_TIM15}, // TIM15_CH1
 			}},
 			TimerChannel{Pins: []PinFunction{
-				{PA3, AF14_TIM2_TIM15_TIM16_TIM17_UCPD1},
+				{PA3, AF_TIM15}, // TIM15_CH2
 			}},
 			TimerChannel{Pins: []PinFunction{}},
 			TimerChannel{Pins: []PinFunction{}},
@@ -509,8 +436,8 @@ var (
 		Device:         stm32.TIM16,
 		Channels: [4]TimerChannel{
 			TimerChannel{Pins: []PinFunction{
-				{PA6, AF14_TIM2_TIM15_TIM16_TIM17_UCPD1},
-				{PB8, AF14_TIM2_TIM15_TIM16_TIM17_UCPD1},
+				{PA6, AF_TIM16}, // TIM16_CH1
+				{PB8, AF_TIM16}, // TIM16_CH1
 			}},
 			TimerChannel{Pins: []PinFunction{}},
 			TimerChannel{Pins: []PinFunction{}},

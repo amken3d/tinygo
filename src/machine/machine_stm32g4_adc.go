@@ -4,12 +4,35 @@ package machine
 
 import (
 	"device/stm32"
+	"runtime/volatile"
+	"unsafe"
+)
+
+// ADC Common Control Register (CCR) - located at ADC1 base + 0x300
+// This register controls clock mode for ADC1 and ADC2
+const (
+	adcCommonCCRAddr = 0x50000308 // ADC12_COMMON->CCR address
+
+	// CKMODE bits (16:17) - ADC clock mode selection
+	adcBasicCKMODE_Pos  = 16
+	adcBasicCKMODE_Msk  = 0x3 << adcBasicCKMODE_Pos
+	adcBasicCKMODE_DIV4 = 0x3 << adcBasicCKMODE_Pos // Synchronous clock mode (HCLK/4)
 )
 
 // InitADC initializes the registers needed for ADC1.
 func InitADC() {
 	// Enable ADC clock (ADC12 on AHB2)
 	stm32.RCC.AHB2ENR.SetBits(stm32.RCC_AHB2ENR_ADC12EN)
+
+	// Configure ADC clock source in ADC Common CCR register
+	// Use synchronous clock mode (HCLK/4) which bypasses the need
+	// for configuring RCC_CCIPR.ADC12SEL
+	// At 170MHz HCLK, HCLK/4 = 42.5MHz ADC clock (max is 60MHz per RM0440)
+	ccr := (*volatile.Register32)(unsafe.Pointer(uintptr(adcCommonCCRAddr)))
+	ccrVal := ccr.Get()
+	ccrVal &^= adcBasicCKMODE_Msk // Clear CKMODE bits
+	ccrVal |= adcBasicCKMODE_DIV4 // Set HCLK/4
+	ccr.Set(ccrVal)
 
 	// Exit deep power-down mode and enable voltage regulator
 	stm32.ADC1.CR.ClearBits(stm32.ADC_CR_DEEPPWD)
@@ -44,8 +67,17 @@ func InitADC() {
 	}
 }
 
+// adcInitialized tracks whether the ADC has been initialized
+var adcInitialized bool
+
 // Configure configures an ADC pin to be able to read analog data.
 func (a ADC) Configure(ADCConfig) {
+	// Ensure ADC is initialized (clock source configured, calibrated, enabled)
+	if !adcInitialized {
+		InitADC()
+		adcInitialized = true
+	}
+
 	a.Pin.ConfigureAltFunc(PinConfig{Mode: PinInputAnalog}, 0)
 
 	// Set sample time (247.5 ADC clock cycles for best accuracy)
