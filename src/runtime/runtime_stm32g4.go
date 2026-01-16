@@ -39,6 +39,7 @@ VCO = 16MHz / 4 * 85 = 340MHz (valid range is 96-344MHz)
 */
 func initCLK() {
 	// Enable PWR clock
+
 	stm32.RCC.APB1ENR1.SetBits(stm32.RCC_APB1ENR1_PWREN)
 	// Read back to ensure the write is complete (memory barrier)
 	_ = stm32.RCC.APB1ENR1.Get()
@@ -87,11 +88,11 @@ func initCLK() {
 	for !stm32.RCC.CR.HasBits(stm32.RCC_CR_PLLRDY) {
 	}
 
-	// Set flash latency to 8 wait states (required for 170MHz in Range 1 Boost)
+	// Set flash latency to 4 wait states (required for 170MHz in Range 1 Boost)
 	// Must be set BEFORE switching to higher frequency clock
-	const FLASH_LATENCY_8 = 8
-	stm32.FLASH.ACR.ReplaceBits(FLASH_LATENCY_8, stm32.Flash_ACR_LATENCY_Msk, 0)
-	for (stm32.FLASH.ACR.Get() & stm32.Flash_ACR_LATENCY_Msk) != FLASH_LATENCY_8 {
+	const FLASH_LATENCY_4 = 4
+	stm32.FLASH.ACR.ReplaceBits(FLASH_LATENCY_4, stm32.Flash_ACR_LATENCY_Msk, 0)
+	for (stm32.FLASH.ACR.Get() & stm32.Flash_ACR_LATENCY_Msk) != FLASH_LATENCY_4 {
 	}
 
 	// Enable prefetch buffer, instruction cache and data cache

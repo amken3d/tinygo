@@ -520,51 +520,31 @@ var (
 	}
 )
 
-func (t *TIM) registerUPInterrupt() interrupt.Interrupt {
+// registerInterrupt registers a unified interrupt handler for the timer.
+// This handler processes all timer events (Update, Output Compare, etc.)
+// since most STM32G4 timers use a single IRQ for all events.
+func (t *TIM) registerInterrupt() interrupt.Interrupt {
 	switch t {
 	case &TIM1:
-		return interrupt.New(irq_TIM1_UP_TIM16, TIM1.handleUPInterrupt)
+		// TIM1 has separate UP and CC IRQs, but we use UP for the unified handler
+		return interrupt.New(irq_TIM1_UP_TIM16, TIM1.handleInterrupt)
 	case &TIM2:
-		return interrupt.New(irq_TIM2, TIM2.handleUPInterrupt)
+		return interrupt.New(irq_TIM2, TIM2.handleInterrupt)
 	case &TIM3:
-		return interrupt.New(irq_TIM3, TIM3.handleUPInterrupt)
+		return interrupt.New(irq_TIM3, TIM3.handleInterrupt)
 	case &TIM4:
-		return interrupt.New(irq_TIM4, TIM4.handleUPInterrupt)
+		return interrupt.New(irq_TIM4, TIM4.handleInterrupt)
 	case &TIM6:
-		return interrupt.New(irq_TIM6, TIM6.handleUPInterrupt)
+		return interrupt.New(irq_TIM6, TIM6.handleInterrupt)
 	case &TIM7:
-		return interrupt.New(irq_TIM7, TIM7.handleUPInterrupt)
+		return interrupt.New(irq_TIM7, TIM7.handleInterrupt)
 	case &TIM8:
-		return interrupt.New(irq_TIM8_UP, TIM8.handleUPInterrupt)
+		// TIM8 has separate UP and CC IRQs, but we use UP for the unified handler
+		return interrupt.New(irq_TIM8_UP, TIM8.handleInterrupt)
 	case &TIM15:
-		return interrupt.New(irq_TIM1_BRK_TIM15, TIM15.handleUPInterrupt)
+		return interrupt.New(irq_TIM1_BRK_TIM15, TIM15.handleInterrupt)
 	case &TIM16:
-		return interrupt.New(irq_TIM1_UP_TIM16, TIM16.handleUPInterrupt)
-	}
-
-	return interrupt.Interrupt{}
-}
-
-func (t *TIM) registerOCInterrupt() interrupt.Interrupt {
-	switch t {
-	case &TIM1:
-		return interrupt.New(irq_TIM1_CC, TIM1.handleOCInterrupt)
-	case &TIM2:
-		return interrupt.New(irq_TIM2, TIM2.handleOCInterrupt)
-	case &TIM3:
-		return interrupt.New(irq_TIM3, TIM3.handleOCInterrupt)
-	case &TIM4:
-		return interrupt.New(irq_TIM4, TIM4.handleOCInterrupt)
-	case &TIM6:
-		return interrupt.New(irq_TIM6, TIM6.handleOCInterrupt)
-	case &TIM7:
-		return interrupt.New(irq_TIM7, TIM7.handleOCInterrupt)
-	case &TIM8:
-		return interrupt.New(irq_TIM8_CC, TIM8.handleOCInterrupt)
-	case &TIM15:
-		return interrupt.New(irq_TIM1_BRK_TIM15, TIM15.handleOCInterrupt)
-	case &TIM16:
-		return interrupt.New(irq_TIM1_UP_TIM16, TIM16.handleOCInterrupt)
+		return interrupt.New(irq_TIM1_UP_TIM16, TIM16.handleInterrupt)
 	}
 
 	return interrupt.Interrupt{}

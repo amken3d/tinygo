@@ -39,11 +39,11 @@ const (
 	A7 = PA2 // ADC1_IN3
 )
 
-// User LD2: the green LED is connected to PB3 (Arduino D13)
+// User LD2: the green LED is connected to PB8 on Nucleo-32 boards
 const (
 	LED         = LED_BUILTIN
 	LED_BUILTIN = LED_GREEN
-	LED_GREEN   = PB3
+	LED_GREEN   = PB8
 )
 
 const (
