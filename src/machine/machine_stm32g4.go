@@ -35,6 +35,16 @@ const (
 	AF_TIM16 = 1 // TIM16 on PA6, PB8
 )
 
+// Alternate function constants for peripheral configuration
+// These match the STM32G4 datasheet alternate function mappings
+const (
+	AF4_I2C1_I2C2_I2C3_I2C4  = 4 // I2C peripherals
+	AF5_SPI1_SPI2_I2S2_I2S3  = 5 // SPI/I2S peripherals
+	AF7_USART1_USART2_USART3 = 7 // USART peripherals
+	AF8_LPUART1              = 8 // LPUART1
+	AF9_FDCAN1               = 9 // FDCAN1
+)
+
 // IRQ constants for timers
 const (
 	irq_TIM1_BRK_TIM15 = stm32.IRQ_TIM1_BRK_TIM15
@@ -183,9 +193,15 @@ func (p Pin) registerInterrupt() interrupt.Interrupt {
 //---------- UART related code
 
 // Configure the UART.
+// If TxAltFuncSelector or RxAltFuncSelector is 0xFF, pin configuration is skipped
+// (pins should be pre-configured using type-safe methods from machine_stm32g4_altfunc.go).
 func (uart *UART) configurePins(config UARTConfig) {
-	config.TX.ConfigureAltFunc(PinConfig{Mode: PinModeUARTTX}, uart.TxAltFuncSelector)
-	config.RX.ConfigureAltFunc(PinConfig{Mode: PinModeUARTRX}, uart.RxAltFuncSelector)
+	if uart.TxAltFuncSelector != 0xFF {
+		config.TX.ConfigureAltFunc(PinConfig{Mode: PinModeUARTTX}, uart.TxAltFuncSelector)
+	}
+	if uart.RxAltFuncSelector != 0xFF {
+		config.RX.ConfigureAltFunc(PinConfig{Mode: PinModeUARTRX}, uart.RxAltFuncSelector)
+	}
 }
 
 // UART baudrate calc based on the bus and target baud rate
@@ -254,8 +270,13 @@ func (spi *SPI) getBaudRate(config SPIConfig) uint32 {
 	return conf << stm32.SPI_CR1_BR_Pos
 }
 
-// Configure SPI pins for input output and clock
+// Configure SPI pins for input output and clock.
+// If AltFuncSelector is 0xFF, pin configuration is skipped
+// (pins should be pre-configured using type-safe methods from machine_stm32g4_altfunc.go).
 func (spi *SPI) configurePins(config SPIConfig) {
+	if spi.AltFuncSelector == 0xFF {
+		return
+	}
 	config.SCK.ConfigureAltFunc(PinConfig{Mode: PinModeSPICLK}, spi.AltFuncSelector)
 	config.SDO.ConfigureAltFunc(PinConfig{Mode: PinModeSPISDO}, spi.AltFuncSelector)
 	config.SDI.ConfigureAltFunc(PinConfig{Mode: PinModeSPISDI}, spi.AltFuncSelector)
@@ -288,18 +309,38 @@ var (
 		EnableFlag:     stm32.RCC_APB2ENR_TIM1EN,
 		Device:         stm32.TIM1,
 		Channels: [4]TimerChannel{
-			TimerChannel{Pins: []PinFunction{
-				{PA8, AF_TIM1}, // TIM1_CH1
-			}},
-			TimerChannel{Pins: []PinFunction{
-				{PA9, AF_TIM1}, // TIM1_CH2
-			}},
-			TimerChannel{Pins: []PinFunction{
-				{PA10, AF_TIM1}, // TIM1_CH3
-			}},
-			TimerChannel{Pins: []PinFunction{
-				{PA11, AF_TIM1}, // TIM1_CH4
-			}},
+			TimerChannel{
+				Pins: []PinFunction{
+					{PA8, AF_TIM1}, // TIM1_CH1
+				},
+				ComplementaryPins: []PinFunction{
+					{PA7, AF_TIM1},  // TIM1_CH1N
+					{PB13, AF_TIM1}, // TIM1_CH1N (alternate)
+				},
+			},
+			TimerChannel{
+				Pins: []PinFunction{
+					{PA9, AF_TIM1}, // TIM1_CH2
+				},
+				ComplementaryPins: []PinFunction{
+					{PB0, AF_TIM1},  // TIM1_CH2N
+					{PB14, AF_TIM1}, // TIM1_CH2N (alternate)
+				},
+			},
+			TimerChannel{
+				Pins: []PinFunction{
+					{PA10, AF_TIM1}, // TIM1_CH3
+				},
+				ComplementaryPins: []PinFunction{
+					{PB1, AF_TIM1}, // TIM1_CH3N
+					{PB15, 4},      // TIM1_CH3N (alternate, AF4)
+				},
+			},
+			TimerChannel{
+				Pins: []PinFunction{
+					{PA11, AF_TIM1}, // TIM1_CH4 (no complementary output)
+				},
+			},
 		},
 		busFreq: APB2_TIM_FREQ,
 	}

@@ -24,7 +24,8 @@ type PinFunction struct {
 }
 
 type TimerChannel struct {
-	Pins []PinFunction
+	Pins              []PinFunction
+	ComplementaryPins []PinFunction // CHxN pins (only for TIM1/TIM8 channels 0-2)
 }
 
 type TIM struct {

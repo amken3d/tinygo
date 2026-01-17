@@ -101,6 +101,61 @@ func (t *TIM) DisableComplementaryOutput(channel uint8) {
 	}
 }
 
+// ComplementaryChannel configures a complementary (CHxN) pin for a channel.
+// Returns the channel number or an error if the pin is not valid.
+// Only available on advanced timers (TIM1, TIM8) for channels 0-2.
+func (t *TIM) ComplementaryChannel(pin Pin) (uint8, error) {
+	if !t.IsAdvancedTimer() {
+		return 0, ErrNotAdvancedTimer
+	}
+
+	for chi := 0; chi < 3; chi++ { // Only channels 0-2 have complementary outputs
+		ch := t.Channels[chi]
+		for _, p := range ch.ComplementaryPins {
+			if p.Pin == pin {
+				t.configurePin(uint8(chi), p)
+				return uint8(chi), nil
+			}
+		}
+	}
+
+	return 0, ErrInvalidOutputPin
+}
+
+// SetComplementary configures and enables complementary PWM output for a channel.
+// This enables both the main (CCxE) and complementary (CCxNE) outputs.
+// The complementary output is the inverted version of the main output.
+// Use SetDeadTimeNs() to insert dead-time between switching.
+func (t *TIM) SetComplementary(channel uint8, value uint32) error {
+	if !t.IsAdvancedTimer() {
+		return ErrNotAdvancedTimer
+	}
+	if channel > 2 {
+		return errors.New("timer: complementary output only available on channels 0-2")
+	}
+
+	t.EnableMainOutput()
+
+	// Set output compare mode to PWM mode 1 and set compare value
+	switch channel {
+	case 0:
+		t.Device.CCMR1_Output.ReplaceBits(PWM_MODE1<<stm32.TIM_CCMR1_Output_OC1M_Pos, stm32.TIM_CCMR1_Output_OC1M_Msk, 0)
+		t.Device.CCR1.Set(arrtype(value))
+	case 1:
+		t.Device.CCMR1_Output.ReplaceBits(PWM_MODE1<<stm32.TIM_CCMR1_Output_OC2M_Pos, stm32.TIM_CCMR1_Output_OC2M_Msk, 0)
+		t.Device.CCR2.Set(arrtype(value))
+	case 2:
+		t.Device.CCMR2_Output_Reg().ReplaceBits(PWM_MODE1<<stm32.TIM_CCMR2_Output_OC3M_Pos, stm32.TIM_CCMR2_Output_OC3M_Msk, 0)
+		t.Device.CCR3_Reg().Set(arrtype(value))
+	}
+
+	// Enable both main and complementary outputs
+	// CCxE is at bit 0,4,8 and CCxNE is at bit 2,6,10 for channels 1,2,3
+	t.Device.CCER.SetBits((stm32.TIM_CCER_CC1E | stm32.TIM_CCER_CC1NE) << (channel * 4))
+
+	return nil
+}
+
 // SetComplementaryPolarity sets the polarity of the complementary output.
 // If inverted is true, CCxN is active low. If false, CCxN is active high.
 func (t *TIM) SetComplementaryPolarity(channel uint8, inverted bool) {

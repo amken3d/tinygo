@@ -135,7 +135,7 @@ const (
 	VBUS = PA0 // ADC1_IN1 - DC bus voltage (scaled)
 
 	// Temperature sensing
-	TEMPERATURE = PC5 // ADC2_IN11 - NTC thermistor (if populated)
+	TEMPERATURE = PB14 // ADC2_IN11 - NTC thermistor (if populated)
 )
 
 // =============================================================================
@@ -156,6 +156,7 @@ const (
 	CAN_RX_PIN = PA11 // FDCAN1_RX
 	CAN_TX_PIN = PB9  // FDCAN1_TX
 	CAN_SHDN   = PC11 // CAN transceiver shutdown (directly active low)
+	CAN_TERM   = PC14
 
 	// SPI is not directly exposed but pins are available
 	SPI0_SCK_PIN = PB3 // SPI1_SCK (shared with UART_TX)
@@ -168,14 +169,13 @@ const (
 // =============================================================================
 
 const (
-	A0 = PA0 // VBUS voltage sensing
-	A1 = PA1 // Current sense 1 (OPAMP1+)
-	A2 = PA3 // Current sense 1 out
-	A3 = PA4 // BEMF1
-	A4 = PA5 // Current sense 2-
-	A5 = PA7 // Current sense 2+
-	A6 = PB0 // Current sense 3+
-	A7 = PB2 // Current sense 3-
+	VBUS     = PA0 // VBUS voltage sensing
+	U_OPAMPH = PA1 // Current sense 1 (OPAMP1+)
+	U_OPAMPL = PA3 // Current sense 1 out
+	V_OPAML  = PA5 // Current sense 2-
+	V_OPAMPH = PA7 // Current sense 2+
+	W_OPAMPH = PB0 // Current sense 3+
+	W_OPAML  = PB2 // Current sense 3-
 )
 
 // =============================================================================
@@ -193,7 +193,7 @@ const (
 
 const (
 	// Potentiometer for manual speed control (directly on daughterboard)
-	POTENTIOMETER = PA2 // ADC1_IN3
+	POTENTIOMETER = PB12 // ADC1_IN3
 )
 
 // =============================================================================
@@ -201,7 +201,7 @@ const (
 // =============================================================================
 
 var (
-	// UART2 is directly exposed on the connector
+	// UART2 is exposed on the connector
 	UART1  = &_UART1
 	_UART1 = UART{
 		Buffer:            NewRingBuffer(),
@@ -211,14 +211,14 @@ var (
 	}
 	DefaultUART = UART1
 
-	// I2C1 (directly shared with Hall sensor pins, choose one or the other)
+	// I2C1 (shared with Hall sensor pins - choose one or the other)
 	I2C1 = &I2C{
 		Bus:             stm32.I2C1,
 		AltFuncSelector: AF4_I2C1_I2C2_I2C3_I2C4,
 	}
 	I2C0 = I2C1
 
-	// SPI1 (directly limited availability due to pin sharing)
+	// SPI1 (limited availability due to pin sharing with UART)
 	SPI1 = &SPI{
 		Bus:             stm32.SPI1,
 		AltFuncSelector: AF5_SPI1_SPI2_I2S2_I2S3,

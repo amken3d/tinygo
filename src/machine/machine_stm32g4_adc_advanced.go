@@ -156,12 +156,27 @@ type ADCAdvancedConfig struct {
 // =============================================================================
 // ADC Peripheral Methods
 // =============================================================================
+func ConfigureADCClock() {
+	// Enable ADC12 clock in RCC
+	stm32.RCC.AHB2ENR.SetBits(stm32.RCC_AHB2ENR_ADC12EN)
+
+	// ADC12_Common CCR register is at ADC1 base + 0x308
+	// This is shared between ADC1 and ADC2
+	const adcCommonCCR = 0x50000308
+	ccr := (*volatile.Register32)(unsafe.Pointer(uintptr(adcCommonCCR)))
+
+	// Set CKMODE to synchronous HCLK/4 (bits 16-17 = 0b11)
+	// This provides a stable clock for both ADC1 and ADC2
+	ccrVal := ccr.Get()
+	ccrVal &^= 0x30000 // Clear CKMODE bits
+	ccrVal |= 0x30000  // Set HCLK/4 (0b11 << 16)
+	ccr.Set(ccrVal)
+}
 
 // Enable powers up and enables the ADC peripheral
 func (a *ADCPeripheral) Enable() error {
 	// Enable ADC clock
-	stm32.RCC.AHB2ENR.SetBits(stm32.RCC_AHB2ENR_ADC12EN)
-
+	ConfigureADCClock()
 	// Exit deep power-down mode
 	a.instance.CR.ClearBits(stm32.ADC_CR_DEEPPWD)
 
