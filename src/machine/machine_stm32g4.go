@@ -316,6 +316,7 @@ var (
 				ComplementaryPins: []PinFunction{
 					{PA7, AF_TIM1},  // TIM1_CH1N
 					{PB13, AF_TIM1}, // TIM1_CH1N (alternate)
+					{PC13, 4},       // TIM1_CH1N (alternate, AF4)
 				},
 			},
 			TimerChannel{
@@ -325,6 +326,7 @@ var (
 				ComplementaryPins: []PinFunction{
 					{PB0, AF_TIM1},  // TIM1_CH2N
 					{PB14, AF_TIM1}, // TIM1_CH2N (alternate)
+					{PA12, AF_TIM1}, // TIM1_CH2N (alternate, AF6)
 				},
 			},
 			TimerChannel{

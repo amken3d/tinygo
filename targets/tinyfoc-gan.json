@@ -1,0 +1,7 @@
+{
+    "inherits": ["stm32g431"],
+    "build-tags": ["tinyfoc_gan"],
+    "serial": "uart",
+    "openocd-interface": "stlink",
+    "openocd-commands": ["reset_config srst_only connect_assert_srst"]
+}
