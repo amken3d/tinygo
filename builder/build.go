@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -281,9 +282,13 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 				allFiles[file.Name] = append(allFiles[file.Name], file)
 			}
 		}
-		for name, files := range allFiles {
-			name := name
-			files := files
+		// Sort embedded files by name to maintain output determinism.
+		embedNames := make([]string, 0, len(allFiles))
+		for _, files := range allFiles {
+			embedNames = append(embedNames, files[0].Name)
+		}
+		slices.Sort(embedNames)
+		for _, name := range embedNames {
 			job := &compileJob{
 				description: "make object file for " + name,
 				run: func(job *compileJob) error {
@@ -298,7 +303,7 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 					sum := sha256.Sum256(data)
 					hexSum := hex.EncodeToString(sum[:16])
 
-					for _, file := range files {
+					for _, file := range allFiles[name] {
 						file.Size = uint64(len(data))
 						file.Hash = hexSum
 						if file.NeedsData {
@@ -540,6 +545,23 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 				pkgMod, err := ctx.ParseBitcodeFile(pkgJob.result)
 				if err != nil {
 					return fmt.Errorf("failed to load bitcode file: %w", err)
+				}
+				// Resolve duplicate function definitions before linking.
+				// This can happen when a newer Go version adds a function
+				// body in a standard library package that was previously
+				// just a declaration provided by //go:linkname from the
+				// runtime. In that case, keep the existing (runtime)
+				// definition by weakening the new one's linkage so the
+				// LLVM linker discards it in favor of the existing one.
+				for fn := pkgMod.FirstFunction(); !fn.IsNil(); fn = llvm.NextFunction(fn) {
+					if fn.IsDeclaration() {
+						continue
+					}
+					existing := mod.NamedFunction(fn.Name())
+					if existing.IsNil() || existing.IsDeclaration() {
+						continue
+					}
+					fn.SetLinkage(llvm.LinkOnceODRLinkage)
 				}
 				err = llvm.LinkModules(mod, pkgMod)
 				if err != nil {

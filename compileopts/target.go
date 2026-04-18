@@ -24,6 +24,7 @@ import (
 // https://github.com/shepmaster/rust-arduino-blink-led-no-core-with-cargo/blob/master/blink/arduino.json
 type TargetSpec struct {
 	Inherits         []string `json:"inherits,omitempty"`
+	InheritableOnly  bool     `json:"inheritable-only"` // this target is only meant to be inherited from, not used directly
 	Triple           string   `json:"llvm-target,omitempty"`
 	CPU              string   `json:"cpu,omitempty"`
 	ABI              string   `json:"target-abi,omitempty"` // roughly equivalent to -mabi= flag
@@ -63,6 +64,9 @@ type TargetSpec struct {
 	OpenOCDCommands  []string `json:"openocd-commands,omitempty"`
 	OpenOCDVerify    *bool    `json:"openocd-verify,omitempty"` // enable verify when flashing with openocd
 	JLinkDevice      string   `json:"jlink-device,omitempty"`
+	ADBPreCommands   []string `json:"adb-pre-commands,omitempty"`
+	ADBPushRemote    string   `json:"adb-push-remote,omitempty"`
+	ADBPostCommands  []string `json:"adb-post-commands,omitempty"`
 	CodeModel        string   `json:"code-model,omitempty"`
 	RelocationModel  string   `json:"relocation-model,omitempty"`
 	WITPackage       string   `json:"wit-package,omitempty"`
@@ -148,6 +152,11 @@ func (spec *TargetSpec) loadFromGivenStr(str string) error {
 
 // resolveInherits loads inherited targets, recursively.
 func (spec *TargetSpec) resolveInherits() error {
+	// Save InheritableOnly before resolving, since it must not propagate
+	// from parent to child (a board target should not become inheritable-only
+	// just because its parent processor target is).
+	inheritableOnly := spec.InheritableOnly
+
 	// First create a new spec with all the inherited properties.
 	newSpec := &TargetSpec{}
 	for _, name := range spec.Inherits {
@@ -172,6 +181,9 @@ func (spec *TargetSpec) resolveInherits() error {
 		return err
 	}
 	*spec = *newSpec
+
+	// Restore InheritableOnly from the original spec, not from parents.
+	spec.InheritableOnly = inheritableOnly
 
 	return nil
 }
@@ -239,10 +251,17 @@ func GetTargetSpecs() (map[string]*TargetSpec, error) {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
+
 		spec, err := LoadTarget(&Options{Target: path})
 		if err != nil {
 			return nil, fmt.Errorf("could not list target: %w", err)
 		}
+
+		if spec.InheritableOnly {
+			// Skip targets that are only meant to be inherited from, not used directly.
+			continue
+		}
+
 		if spec.FlashMethod == "" && spec.FlashCommand == "" && spec.Emulator == "" {
 			// This doesn't look like a regular target file, but rather like
 			// a parent target (such as targets/cortex-m.json).

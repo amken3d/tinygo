@@ -107,6 +107,9 @@ func TestBuild(t *testing.T) {
 	if minor >= 23 {
 		tests = append(tests, "go1.23/")
 	}
+	if minor >= 24 {
+		tests = append(tests, "typealias.go")
+	}
 
 	if *testTarget != "" {
 		// This makes it possible to run one specific test (instead of all),
@@ -451,7 +454,7 @@ func runTestWithConfig(name string, t *testing.T, options compileopts.Options, c
 
 	// Build the test binary.
 	stdout := &bytes.Buffer{}
-	_, err = buildAndRun(pkgName, config, stdout, cmdArgs, environmentVars, time.Minute, func(cmd *exec.Cmd, result builder.BuildResult) error {
+	_, err = buildAndRun(pkgName, config, stdout, cmdArgs, environmentVars, 2*time.Minute, func(cmd *exec.Cmd, result builder.BuildResult) error {
 		return cmd.Run()
 	})
 	if err != nil {

@@ -5,7 +5,9 @@ package machine
 import (
 	"device/esp"
 	"errors"
+	"runtime/interrupt"
 	"runtime/volatile"
+	"sync"
 	"unsafe"
 )
 
@@ -70,6 +72,7 @@ const (
 	PinInput
 	PinInputPullup
 	PinInputPulldown
+	PinAnalog
 )
 
 // Hardware pin numbers
@@ -121,6 +124,29 @@ const (
 	GPIO48 Pin = 48
 )
 
+const (
+	ADC0  Pin = GPIO1
+	ADC2  Pin = GPIO2
+	ADC3  Pin = GPIO3
+	ADC4  Pin = GPIO4
+	ADC5  Pin = GPIO5
+	ADC6  Pin = GPIO6
+	ADC7  Pin = GPIO7
+	ADC8  Pin = GPIO8
+	ADC9  Pin = GPIO9
+	ADC10 Pin = GPIO10
+	ADC11 Pin = GPIO11
+	ADC12 Pin = GPIO12
+	ADC13 Pin = GPIO13
+	ADC14 Pin = GPIO14
+	ADC15 Pin = GPIO15
+	ADC16 Pin = GPIO16
+	ADC17 Pin = GPIO17
+	ADC18 Pin = GPIO18
+	ADC19 Pin = GPIO19
+	ADC20 Pin = GPIO20
+)
+
 // Configure this pin with the given configuration.
 func (p Pin) Configure(config PinConfig) {
 	// Output function 256 is a special value reserved for use as a regular GPIO
@@ -146,8 +172,10 @@ func (p Pin) configure(config PinConfig, signal uint32) {
 	// MCU_SEL: Function 1 is always GPIO
 	ioConfig |= (1 << esp.IO_MUX_GPIO_MCU_SEL_Pos)
 
-	// FUN_IE: Make this pin an input pin (always set for GPIO operation)
-	ioConfig |= esp.IO_MUX_GPIO_FUN_IE
+	// FUN_IE: disable for PinAnalog (high-Z for ADC), enable for digital
+	if config.Mode != PinAnalog {
+		ioConfig |= esp.IO_MUX_GPIO_FUN_IE
+	}
 
 	// DRV: Set drive strength to 20 mA as a default. Pins 17 and 18 are special
 	var drive uint32
@@ -158,7 +186,7 @@ func (p Pin) configure(config PinConfig, signal uint32) {
 	}
 	ioConfig |= (drive << esp.IO_MUX_GPIO_FUN_DRV_Pos)
 
-	// WPU/WPD: Select pull mode.
+	// WPU/WPD: no pulls for PinAnalog
 	if config.Mode == PinInputPullup {
 		ioConfig |= esp.IO_MUX_GPIO_FUN_WPU
 	} else if config.Mode == PinInputPulldown {
@@ -181,14 +209,14 @@ func (p Pin) configure(config PinConfig, signal uint32) {
 		// output signal, or the special value 256 which indicates regular GPIO
 		// usage.
 		p.outFunc().Set(signal)
-	case PinInput, PinInputPullup, PinInputPulldown:
+	case PinInput, PinInputPullup, PinInputPulldown, PinAnalog:
 		// Clear the 'output enable' bit.
 		if p < 32 {
 			esp.GPIO.ENABLE_W1TC.Set(1 << p)
 		} else {
 			esp.GPIO.ENABLE1_W1TC.Set(1 << (p - 32))
 		}
-		if signal != 256 {
+		if signal != 256 && config.Mode != PinAnalog {
 			// Signal is a peripheral function (not a simple GPIO). Connect this
 			// signal to the pin.
 			// Note that outFunc and inFunc work in the opposite direction.
@@ -273,6 +301,95 @@ func (p Pin) Get() bool {
 	}
 }
 
+func (p Pin) pinReg() *volatile.Register32 {
+	return (*volatile.Register32)(unsafe.Add(unsafe.Pointer(&esp.GPIO.PIN0), uintptr(p)*4))
+}
+
+const maxPin = 49
+const cpuInterruptFromPin = 8
+
+type PinChange uint8
+
+// Pin change interrupt constants for SetInterrupt.
+const (
+	PinRising PinChange = iota + 1
+	PinFalling
+	PinToggle
+)
+
+// SetInterrupt sets an interrupt to be executed when a particular pin changes
+// state. The pin should already be configured as an input, including a pull up
+// or down if no external pull is provided.
+//
+// You can pass a nil func to unset the pin change interrupt. If you do so,
+// the change parameter is ignored and can be set to any value (such as 0).
+// If the pin is already configured with a callback, you must first unset
+// this pins interrupt before you can set a new callback.
+func (p Pin) SetInterrupt(change PinChange, callback func(Pin)) (err error) {
+	if p >= maxPin {
+		return ErrInvalidInputPin
+	}
+
+	if callback == nil {
+		// Disable this pin interrupt
+		p.pinReg().ClearBits(esp.GPIO_PIN_INT_TYPE_Msk | esp.GPIO_PIN_INT_ENA_Msk)
+
+		if pinCallbacks[p] != nil {
+			pinCallbacks[p] = nil
+		}
+		return nil
+	}
+
+	if pinCallbacks[p] != nil {
+		// The pin was already configured.
+		// To properly re-configure a pin, unset it first and set a new
+		// configuration.
+		return ErrNoPinChangeChannel
+	}
+	pinCallbacks[p] = callback
+
+	onceSetupPinInterrupt.Do(func() {
+		err = setupPinInterrupt()
+	})
+	if err != nil {
+		return err
+	}
+
+	p.pinReg().Set(
+		(p.pinReg().Get() & ^uint32(esp.GPIO_PIN_INT_TYPE_Msk|esp.GPIO_PIN_INT_ENA_Msk)) |
+			uint32(change)<<esp.GPIO_PIN_INT_TYPE_Pos | uint32(1)<<esp.GPIO_PIN_INT_ENA_Pos)
+
+	return nil
+}
+
+var (
+	pinCallbacks          [maxPin]func(Pin)
+	onceSetupPinInterrupt sync.Once
+)
+
+func setupPinInterrupt() error {
+	esp.INTERRUPT_CORE0.SetGPIO_INTERRUPT_PRO_MAP(cpuInterruptFromPin)
+	return interrupt.New(cpuInterruptFromPin, func(interrupt.Interrupt) {
+		// Check status for GPIO0-31
+		status := esp.GPIO.STATUS.Get()
+		for i, mask := 0, uint32(1); i < 32; i, mask = i+1, mask<<1 {
+			if (status&mask) != 0 && pinCallbacks[i] != nil {
+				pinCallbacks[i](Pin(i))
+			}
+		}
+		// Check status for GPIO32-48
+		status1 := esp.GPIO.STATUS1.Get()
+		for i, mask := 32, uint32(1); i < maxPin; i, mask = i+1, mask<<1 {
+			if (status1&mask) != 0 && pinCallbacks[i] != nil {
+				pinCallbacks[i](Pin(i))
+			}
+		}
+		// Clear interrupt bits
+		esp.GPIO.STATUS_W1TC.SetBits(status)
+		esp.GPIO.STATUS1_W1TC.SetBits(status1)
+	}).Enable()
+}
+
 var DefaultUART = UART0
 
 var (
@@ -309,4 +426,37 @@ func (uart *UART) writeByte(b byte) error {
 
 func (uart *UART) flush() {}
 
-// TODO: SPI
+// GetRNG returns 32-bit random numbers using the ESP32-S3 true random number generator,
+// Random numbers are generated based on the thermal noise in the system and the
+// asynchronous clock mismatch.
+// For maximum entropy also make sure that the SAR_ADC is enabled.
+// See esp32-s3_technical_reference_manual_en.pdf p.920
+func GetRNG() (ret uint32, err error) {
+	// ensure ADC clock is initialized
+	initADCClock()
+
+	// ensure fast RTC clock is enabled
+	if esp.RTC_CNTL.GetCLK_CONF_DIG_CLK8M_EN() == 0 {
+		esp.RTC_CNTL.SetCLK_CONF_DIG_CLK8M_EN(1)
+	}
+
+	return esp.RNG.DATA.Get(), nil
+}
+
+func initADCClock() {
+	if esp.APB_SARADC.GetCLKM_CONF_CLK_EN() == 1 {
+		return
+	}
+
+	// only support ADC_CTRL_CLK set to 1
+	esp.APB_SARADC.SetCLKM_CONF_CLK_SEL(1)
+
+	esp.APB_SARADC.SetCTRL_SARADC_SAR_CLK_GATED(1)
+
+	esp.APB_SARADC.SetCLKM_CONF_CLKM_DIV_NUM(15)
+	esp.APB_SARADC.SetCLKM_CONF_CLKM_DIV_B(1)
+	esp.APB_SARADC.SetCLKM_CONF_CLKM_DIV_A(0)
+
+	esp.APB_SARADC.SetCTRL_SARADC_SAR_CLK_DIV(1)
+	esp.APB_SARADC.SetCLKM_CONF_CLK_EN(1)
+}

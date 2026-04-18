@@ -32,11 +32,14 @@ import (
 	"github.com/tinygo-org/tinygo/goenv"
 	"github.com/tinygo-org/tinygo/loader"
 	"golang.org/x/tools/go/buildutil"
+	"tinygo.org/x/espflasher/pkg/espflasher"
 	"tinygo.org/x/go-llvm"
 
 	"go.bug.st/serial"
 	"go.bug.st/serial/enumerator"
 )
+
+var errInheritableOnly = errors.New("target is inheritable-only, which means it cannot be used directly for building or flashing")
 
 // commandError is an error type to wrap os/exec.Command errors. This provides
 // some more information regarding what went wrong while running a command.
@@ -139,6 +142,10 @@ func printCommand(cmd string, args ...string) {
 
 // Build compiles and links the given package and writes it to outpath.
 func Build(pkgName, outpath string, config *compileopts.Config) error {
+	if config.Target != nil && config.Target.InheritableOnly {
+		return errInheritableOnly
+	}
+
 	// Create a temporary directory for intermediary files.
 	tmpdir, err := os.MkdirTemp("", "tinygo")
 	if err != nil {
@@ -356,6 +363,10 @@ func Flash(pkgName, port, outpath string, options *compileopts.Options) error {
 		return err
 	}
 
+	if config.Target != nil && config.Target.InheritableOnly {
+		return errInheritableOnly
+	}
+
 	// determine the type of file to compile
 	var fileExt string
 
@@ -385,6 +396,10 @@ func Flash(pkgName, port, outpath string, options *compileopts.Options) error {
 		fileExt = ".hex"
 	case "bmp":
 		fileExt = ".elf"
+	case "adb":
+		fileExt = ".hex"
+	case "esp32flash", "esp32jtag":
+		fileExt = ".bin"
 	case "native":
 		return errors.New("unknown flash method \"native\" - did you miss a -target flag?")
 	default:
@@ -517,6 +532,56 @@ func Flash(pkgName, port, outpath string, options *compileopts.Options) error {
 		cmd.Stderr = os.Stderr
 		err = cmd.Run()
 		if err != nil {
+			return &commandError{"failed to flash", result.Binary, err}
+		}
+	case "adb":
+		// Run pre-flash adb shell commands.
+		for _, preCmd := range config.Target.ADBPreCommands {
+			cmd := executeCommand(config.Options, "adb", "shell", preCmd)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return &commandError{"failed to run adb pre-command", preCmd, err}
+			}
+		}
+
+		// Push the binary to the device.
+		if config.Target.ADBPushRemote == "" {
+			return errors.New("invalid target file: flash-method was set to \"adb\" but no adb-push-remote was set")
+		}
+		cmd := executeCommand(config.Options, "adb", "push", result.Binary, config.Target.ADBPushRemote)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return &commandError{"adb push failed to " + config.Target.ADBPushRemote, result.Binary, err}
+		}
+
+		// Run post-flash adb shell commands.
+		for _, postCmd := range config.Target.ADBPostCommands {
+			postCmd = strings.ReplaceAll(postCmd, "{remote}", config.Target.ADBPushRemote)
+			cmd := executeCommand(config.Options, "adb", "shell", postCmd)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return &commandError{"failed to run adb post-command", postCmd, err}
+			}
+		}
+	case "esp32flash":
+		port, err := getDefaultPort(port, config.Target.SerialPort)
+		if err != nil {
+			return &commandError{"failed to find port", port, err}
+		}
+
+		if err := flashBinUsingEsp32(port, classicReset, result.Binary, config.Options); err != nil {
+			return &commandError{"failed to flash", result.Binary, err}
+		}
+	case "esp32jtag":
+		port, err := getDefaultPort(port, config.Target.SerialPort)
+		if err != nil {
+			return &commandError{"failed to find port", port, err}
+		}
+
+		if err := flashBinUsingEsp32(port, jtagReset, result.Binary, config.Options); err != nil {
 			return &commandError{"failed to flash", result.Binary, err}
 		}
 	default:
@@ -763,6 +828,10 @@ func Run(pkgName string, options *compileopts.Options, cmdArgs []string) error {
 	config, err := builder.NewConfig(options)
 	if err != nil {
 		return err
+	}
+
+	if config.Target != nil && config.Target.InheritableOnly {
+		return errInheritableOnly
 	}
 
 	_, err = buildAndRun(pkgName, config, os.Stdout, cmdArgs, nil, 0, func(cmd *exec.Cmd, result builder.BuildResult) error {
@@ -1017,6 +1086,68 @@ func flashHexUsingMSD(volumes []string, tmppath string, options *compileopts.Opt
 		time.Sleep(500 * time.Millisecond)
 	}
 	return errors.New("unable to locate any volume: [" + strings.Join(volumes, ",") + "]")
+}
+
+const (
+	classicReset = "classic"
+	jtagReset    = "jtag"
+)
+
+func flashBinUsingEsp32(port, resetMode, tmppath string, options *compileopts.Options) error {
+	opts := espflasher.DefaultOptions()
+	opts.Compress = true
+	opts.Logger = &espflasher.StdoutLogger{W: os.Stdout}
+	if options.BaudRate != 0 {
+		opts.FlashBaudRate = options.BaudRate
+	}
+
+	// On Windows, we have to explicitly specify the reset mode to use USB JTAG.
+	if runtime.GOOS == "windows" && resetMode == jtagReset {
+		opts.ResetMode = espflasher.ResetUSBJTAG
+	}
+
+	flasher, err := espflasher.New(port, opts)
+	if err != nil {
+		return err
+	}
+	defer flasher.Close()
+
+	chipName := flasher.ChipName()
+	offset := uint32(0x0)
+	if chipName == "ESP32" {
+		offset = 0x1000
+	}
+
+	// Read the firmware binary
+	data, err := os.ReadFile(tmppath)
+	if err != nil {
+		return err
+	}
+
+	if err := flasher.EraseFlash(); err != nil {
+		return fmt.Errorf("erase failed: %v", err)
+	}
+
+	progress := func(current, total int) {
+		pct := float64(current) / float64(total) * 100
+		bar := int(pct / 2)
+		fmt.Printf("\r[%-50s] %6.1f%%", strings.Repeat("#", bar)+strings.Repeat(".", 50-bar), pct)
+		if current >= total {
+			fmt.Println()
+		}
+	}
+
+	// Flash with progress reporting
+	err = flasher.FlashImage(data, offset, progress)
+	if err != nil {
+		return err
+	}
+	fmt.Println()
+
+	// Reset the device to run the new firmware
+	flasher.Reset()
+
+	return nil
 }
 
 type mountPoint struct {

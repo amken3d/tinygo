@@ -245,6 +245,7 @@ func pathsToOverride(goMinor int, needsSyscallPackage bool) map[string]bool {
 		"internal/cm/":                false,
 		"internal/futex/":             false,
 		"internal/fuzz/":              false,
+		"internal/itoa":               false,
 		"internal/reflectlite/":       false,
 		"internal/gclayout":           false,
 		"internal/task/":              false,
@@ -267,11 +268,31 @@ func pathsToOverride(goMinor int, needsSyscallPackage bool) map[string]bool {
 		paths["crypto/internal/boring/sig/"] = false
 	}
 
+	if goMinor >= 26 {
+		// Go 1.26 added a CPU jitter entropy source for FIPS 140-3 that
+		// allocates a 32 MiB global buffer (ScratchBuffer [1<<25]byte).
+		// This is fine on systems with virtual memory, but causes RAM
+		// overflow on microcontrollers. Replace with a zero-size stub
+		// since TinyGo targets never use FIPS jitter entropy.
+		paths["crypto/internal/entropy/"] = true
+		paths["crypto/internal/entropy/v1.0.0/"] = false
+	}
+
 	if needsSyscallPackage {
 		paths["syscall/"] = true // include syscall/js
 		paths["internal/syscall/"] = true
 		paths["internal/syscall/unix/"] = false
 	}
+
+	if goMinor >= 26 {
+		// Go 1.26 added SWAR optimizations to unicode/utf8 that use
+		// constants assuming at least 32-bit uintptr. TinyGo supports
+		// 16-bit targets (AVR) where these constants overflow, so we
+		// provide a patched version.
+		paths["unicode/"] = true
+		paths["unicode/utf8/"] = false
+	}
+
 	return paths
 }
 

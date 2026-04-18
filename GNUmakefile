@@ -289,13 +289,13 @@ WASM_TOOLS_MODULE=go.bytecodealliance.org
 .PHONY: wasi-syscall
 wasi-syscall: wasi-cm
 	rm -rf ./src/internal/wasi/*
-	go run -modfile ./internal/wasm-tools/go.mod $(WASM_TOOLS_MODULE)/cmd/wit-bindgen-go generate --versioned -o ./src/internal -p internal --cm internal/cm ./lib/wasi-cli/wit
+	go run $(WASM_TOOLS_MODULE)/cmd/wit-bindgen-go generate --versioned -o ./src/internal -p internal --cm internal/cm ./lib/wasi-cli/wit
 
 # Copy package cm into src/internal/cm
 .PHONY: wasi-cm
 wasi-cm:
 	rm -rf ./src/internal/cm/*
-	rsync -rv --delete --exclude go.mod --exclude '*_test.go' --exclude '*_json.go' --exclude '*.md' --exclude LICENSE $(shell go list -modfile ./internal/wasm-tools/go.mod -m -f {{.Dir}} $(WASM_TOOLS_MODULE)/cm)/ ./src/internal/cm
+	rsync -rv --delete --exclude go.mod --exclude '*_test.go' --exclude '*_json.go' --exclude '*.md' --exclude LICENSE $(shell go list -m -f {{.Dir}} $(WASM_TOOLS_MODULE)/cm)/ ./src/internal/cm
 
 # Check for Node.js used during WASM tests.
 MIN_NODEJS_VERSION=18
@@ -339,14 +339,17 @@ TEST_PACKAGES_FAST = \
 	embed/internal/embedtest \
 	encoding \
 	encoding/ascii85 \
+	errors \
 	encoding/asn1 \
 	encoding/base32 \
 	encoding/base64 \
 	encoding/csv \
 	encoding/hex \
+	expvar \
 	go/ast \
 	go/format \
 	go/scanner \
+	go/token \
 	go/version \
 	hash \
 	hash/adler32 \
@@ -359,6 +362,7 @@ TEST_PACKAGES_FAST = \
 	math/cmplx \
 	net/http/internal/ascii \
 	net/mail \
+	net/url \
 	os \
 	path \
 	reflect \
@@ -379,6 +383,7 @@ TEST_PACKAGES_FAST = \
 # crypto/des fails on wasi, needs panic()/recover()
 # crypto/hmac fails on wasi, it exits with a "slice out of range" panic
 # debug/plan9obj requires os.ReadAt, which is not yet supported on windows
+# encoding/xml takes a minute on linux and gives a stack overflow on wasi
 # image requires recover(), which is not yet supported on wasi
 # io/ioutil requires os.ReadDir, which is not yet supported on windows or wasi
 # mime: fail on wasi; neds panic()/recover()
@@ -396,11 +401,13 @@ TEST_PACKAGES_FAST = \
 TEST_PACKAGES_LINUX := \
 	archive/zip \
 	compress/flate \
+	context \
 	crypto/aes \
 	crypto/des \
 	crypto/hmac \
 	debug/dwarf \
 	debug/plan9obj \
+	encoding/xml \
 	image \
 	io/ioutil \
 	mime \
@@ -437,6 +444,7 @@ TEST_PACKAGES_NONWASM = \
 	crypto/ecdsa \
 	debug/macho \
 	embed/internal/embedtest \
+	expvar \
 	go/format \
 	os \
 	testing \
@@ -480,7 +488,7 @@ TEST_PACKAGES_HOST := $(TEST_PACKAGES_FAST) $(TEST_PACKAGES_WINDOWS)
 TEST_IOFS := false
 endif
 
-TEST_SKIP_FLAG := -skip='TestExtraMethods|TestParseAndBytesRoundTrip/P256/Generic'
+TEST_SKIP_FLAG := -skip='TestExtraMethods|TestParseAndBytesRoundTrip/P256/Generic|TestParseQueryLimits|TestParseStrictIpv6|TestAsValidation'
 TEST_ADDITIONAL_FLAGS ?=
 
 # Test known-working standard library packages.
@@ -814,6 +822,10 @@ endif
 	@$(MD5SUM) test.hex
 	$(TINYGO) build -size short -o test.hex -target=waveshare-rp2040-tiny examples/echo
 	@$(MD5SUM) test.hex
+	$(TINYGO) build -size short -o test.hex -target=vicharak_shrike-lite examples/echo
+	@$(MD5SUM) test.hex
+	$(TINYGO) build -size short -o test.hex -target=xiao-rp2350        examples/blinky1
+	@$(MD5SUM) test.hex
 	# test pwm
 	$(TINYGO) build -size short -o test.hex -target=itsybitsy-m0        examples/pwm
 	@$(MD5SUM) test.hex
@@ -873,6 +885,12 @@ ifneq ($(STM32), 0)
 	@$(MD5SUM) test.hex
 	$(TINYGO) build -size short -o test.hex -target=stm32l0x1           examples/serial
 	@$(MD5SUM) test.hex
+	$(TINYGO) build -size short -o test.hex -target=arduino-uno-q       examples/blinky1
+	@$(MD5SUM) test.hex
+	$(TINYGO) build -size short -o test.hex -target=arduino-uno-q       examples/serial
+	@$(MD5SUM) test.hex
+	$(TINYGO) build -size short -o test.hex -target=arduino-uno-q       examples/blinkm
+	@$(MD5SUM) test.hex
 endif
 	$(TINYGO) build -size short -o test.hex -target=atmega328pb         examples/blinkm
 	@$(MD5SUM) test.hex
@@ -898,12 +916,22 @@ endif
 	@$(MD5SUM) test.hex
 	$(TINYGO) build -size short -o test.hex -target=digispark           examples/pwm
 	@$(MD5SUM) test.hex
+	$(TINYGO) build -size short -o test.hex -target=digispark           examples/mcp3008
+	@$(MD5SUM) test.hex
 	$(TINYGO) build -size short -o test.hex -target=digispark -gc=leaking examples/blinky1
 	@$(MD5SUM) test.hex
 ifneq ($(XTENSA), 0)
+	$(TINYGO) build -size short -o test.bin -target=esp32-generic       examples/machinetest
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32c3-generic     examples/machinetest
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32s3-generic     examples/machinetest
+	@$(MD5SUM) test.bin
 	$(TINYGO) build -size short -o test.bin -target=esp32-mini32      	examples/blinky1
 	@$(MD5SUM) test.bin
 	$(TINYGO) build -size short -o test.bin -target=esp32c3-supermini   examples/blinky1
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32c3-supermini   examples/blinkm
 	@$(MD5SUM) test.bin
 	$(TINYGO) build -size short -o test.bin -target=nodemcu             examples/blinky1
 	@$(MD5SUM) test.bin
@@ -917,9 +945,39 @@ ifneq ($(XTENSA), 0)
 	@$(MD5SUM) test.bin
 	$(TINYGO) build -size short -o test.bin -target mch2022             examples/machinetest
 	@$(MD5SUM) test.bin
+	# xiao-esp32s3
 	$(TINYGO) build -size short -o test.bin -target=xiao-esp32s3   		examples/blinky1
 	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=xiao-esp32s3   		examples/blinkm
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=xiao-esp32s3   		examples/mcp3008
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=xiao-esp32s3   		examples/pwm
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=xiao-esp32s3   		examples/adc
+	@$(MD5SUM) test.bin
+	# esp32s3-supermini
+	$(TINYGO) build -size short -o test.bin -target=esp32s3-supermini	    examples/blinky1
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32s3-supermini	    examples/blinkm
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32s3-supermini	    examples/mcp3008
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32s3-supermini   	examples/adc
+	@$(MD5SUM) test.bin
 endif
+    # esp32c3-supermini
+	$(TINYGO) build -size short -o test.bin -target=esp32c3-supermini	    examples/blinky1
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32c3-supermini	    examples/blinkm
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32c3-supermini	    examples/mcp3008
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32c3-supermini   	examples/pwm
+	@$(MD5SUM) test.bin
+	$(TINYGO) build -size short -o test.bin -target=esp32c3-supermini   	examples/adc
+	@$(MD5SUM) test.bin
+
 	$(TINYGO) build -size short -o test.bin -target=esp-c3-32s-kit      examples/blinky1
 	@$(MD5SUM) test.bin
 	$(TINYGO) build -size short -o test.bin -target=qtpy-esp32c3        examples/machinetest
@@ -932,6 +990,7 @@ endif
 	@$(MD5SUM) test.bin
 	$(TINYGO) build -size short -o test.bin -target=esp32c3-12f         examples/blinky1
 	@$(MD5SUM) test.bin
+
 	$(TINYGO) build -size short -o test.bin -target=makerfabs-esp32c3spi35 examples/machinetest
 	@$(MD5SUM) test.bin
 	$(TINYGO) build -size short -o test.hex -target=hifive1b            examples/blinky1
@@ -1125,7 +1184,7 @@ endif
 
 .PHONY: tools
 tools:
-	cd internal/tools && go generate -tags tools ./
+	go generate -tags tools ./
 
 LINTDIRS=src/os/ src/reflect/
 .PHONY: lint
