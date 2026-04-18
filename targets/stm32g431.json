@@ -1,6 +1,7 @@
 {
     "inherits": ["cortex-m4"],
     "build-tags": ["stm32g431xx", "stm32g4", "stm32"],
+    "features": 	"+armv7e-m,+dsp,+fpregs,+hwdiv,+thumb-mode,+vfp2sp,+vfp3d16sp,+vfp4d16sp,-aes,-bf16,-cdecp0,-cdecp1,-cdecp2,-cdecp3,-cdecp4,-cdecp5,-cdecp6,-cdecp7,-crc,-crypto,-d32,-dotprod,-fp-armv8,-fp-armv8d16,-fp-armv8d16sp,-fp-armv8sp,-fp16,-fp16fml,-fp64,-fullfp16,-hwdiv-arm,-i8mm,-lob,-mve,-mve.fp,-neon,-pacbti,-ras,-sb,-sha2,-soft-float,-vfp2,-vfp3,-vfp3d16,-vfp3sp,-vfp4,-vfp4d16,-vfp4sp",
     "linkerscript": "targets/stm32g431.ld",
     "extra-files": [
         "src/device/stm32/stm32g431xx.s"
