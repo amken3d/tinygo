@@ -56,8 +56,11 @@ func (uart *UART) Configure(config UARTConfig) {
 	// Set baud rate
 	uart.SetBaudRate(config.BaudRate)
 
-	// Enable USART port, tx, rx and rx interrupts
-	uart.Bus.CR1.Set(stm32.USART_CR1_TE | stm32.USART_CR1_RE | stm32.USART_CR1_RXNEIE | stm32.USART_CR1_UE)
+	// Enable USART port, tx, rx and rx interrupts.
+	// Families with FIFO-mode USARTs (N6) name the RX-not-empty interrupt
+	// enable RXFNEIE instead of RXNEIE; uartRXNotEmptyIE is the per-family
+	// alias covering that rename.
+	uart.Bus.CR1.Set(stm32.USART_CR1_TE | stm32.USART_CR1_RE | uartRXNotEmptyIE | stm32.USART_CR1_UE)
 
 	// Enable RX IRQ
 	uart.Interrupt.SetPriority(0xc0)

@@ -1,0 +1,16 @@
+{
+  "inherits": [
+    "cortex-m55"
+  ],
+  "build-tags": [
+    "stm32n657",
+    "stm32n6",
+    "stm32"
+  ],
+  "extra-files": [
+    "src/device/stm32/stm32n657.s"
+  ],
+  "linkerscript": "targets/stm32n657.ld",
+  "flash-method": "command",
+  "flash-command": "/home/hkeni/GolandProjects/tinygo/tools/stm32n6-flash/flash.sh {elf}"
+}

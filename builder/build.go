@@ -1048,7 +1048,17 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 	outputBinaryFormat := config.BinaryFormat(outext)
 	switch outputBinaryFormat {
 	case "elf":
-		// do nothing, file is already in ELF format
+		// File is already in ELF format. Rename it so result.Binary carries
+		// a .elf extension — downstream tools invoked via `flash-command` with
+		// the `{elf}` token (e.g. STM32CubeProgrammer for N6 SRAM loading)
+		// reject inputs whose extension they don't recognize.
+		if outext != "" && outext != filepath.Ext(result.Executable) {
+			result.Binary = filepath.Join(tmpdir, "main"+outext)
+			if err := os.Rename(result.Executable, result.Binary); err != nil {
+				return result, err
+			}
+			result.Executable = result.Binary
+		}
 	case "hex", "bin":
 		// Extract raw binary, either encoding it as a hex file or as a raw
 		// firmware file.

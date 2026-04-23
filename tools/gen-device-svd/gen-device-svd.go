@@ -221,7 +221,7 @@ func processSubCluster(p *Peripheral, cluster *SVDCluster, clusterOffset uint64,
 	cpRegisters := []*PeripheralField{}
 
 	for _, regEl := range cluster.Registers {
-		cpRegisters = append(cpRegisters, parseRegister(p.GroupName, regEl, p.BaseAddress+clusterOffset, clusterPrefix)...)
+		cpRegisters = append(cpRegisters, parseRegister(p.Name, p.GroupName, regEl, p.BaseAddress+clusterOffset, clusterPrefix)...)
 	}
 	// handle sub-clusters of registers
 	for _, subClusterEl := range cluster.Clusters {
@@ -240,7 +240,7 @@ func processSubCluster(p *Peripheral, cluster *SVDCluster, clusterOffset uint64,
 		if subdim > 1 {
 			subcpRegisters := []*PeripheralField{}
 			for _, regEl := range subClusterEl.Registers {
-				subcpRegisters = append(subcpRegisters, parseRegister(p.GroupName, regEl, p.BaseAddress+clusterOffset+subclusterOffset, subclusterPrefix)...)
+				subcpRegisters = append(subcpRegisters, parseRegister(p.Name, p.GroupName, regEl, p.BaseAddress+clusterOffset+subclusterOffset, subclusterPrefix)...)
 			}
 
 			cpRegisters = append(cpRegisters, &PeripheralField{
@@ -254,7 +254,7 @@ func processSubCluster(p *Peripheral, cluster *SVDCluster, clusterOffset uint64,
 			})
 		} else {
 			for _, regEl := range subClusterEl.Registers {
-				cpRegisters = append(cpRegisters, parseRegister(regEl.Name, regEl, p.BaseAddress+clusterOffset+subclusterOffset, subclusterPrefix)...)
+				cpRegisters = append(cpRegisters, parseRegister(p.Name, regEl.Name, regEl, p.BaseAddress+clusterOffset+subclusterOffset, subclusterPrefix)...)
 			}
 		}
 	}
@@ -316,7 +316,7 @@ func processCluster(p *Peripheral, clusters []*SVDCluster, peripheralDict map[st
 			if regName == "" {
 				regName = p.Name
 			}
-			clusterRegisters = append(clusterRegisters, parseRegister(regName, regEl, p.BaseAddress+clusterOffset, clusterPrefix)...)
+			clusterRegisters = append(clusterRegisters, parseRegister(p.Name, regName, regEl, p.BaseAddress+clusterOffset, clusterPrefix)...)
 		}
 		sort.SliceStable(clusterRegisters, func(i, j int) bool {
 			return clusterRegisters[i].Address < clusterRegisters[j].Address
@@ -392,12 +392,17 @@ func readSVD(path, sourceURL string) (*Device, error) {
 		}
 
 		for _, interrupt := range periphEl.Interrupts {
-			addInterrupt(interrupts, interrupt.Name, interrupt.Name, interrupt.Index, description)
+			// Normalize interrupt names — the STM32L0 SVDs ship with leading
+			// whitespace on some entries (e.g. "<name> FLASH</name>") which
+			// otherwise flows through into generated identifiers like
+			// `interrupt FLASH` / `IRQ_ FLASH` that won't compile.
+			intrName := cleanName(strings.TrimSpace(interrupt.Name))
+			addInterrupt(interrupts, intrName, intrName, interrupt.Index, description)
 			// As a convenience, also use the peripheral name as the interrupt
 			// name. Only do that for the nrf for now, as the stm32 .svd files
 			// don't always put interrupts in the correct peripheral...
 			if len(periphEl.Interrupts) == 1 && strings.HasPrefix(device.Name, "nrf") {
-				addInterrupt(interrupts, periphEl.Name, interrupt.Name, interrupt.Index, description)
+				addInterrupt(interrupts, periphEl.Name, intrName, interrupt.Index, description)
 			}
 		}
 
@@ -447,12 +452,26 @@ func readSVD(path, sourceURL string) (*Device, error) {
 			groups[groupName] = p
 		}
 
+		seenRegNames := map[string]bool{}
 		for _, register := range periphEl.Registers {
 			regName := groupName // preferably use the group name
 			if regName == "" {
 				regName = periphEl.Name // fall back to peripheral name
 			}
-			p.Registers = append(p.Registers, parseRegister(regName, register, baseAddress, "")...)
+			for _, f := range parseRegister(periphEl.Name, regName, register, baseAddress, "") {
+				// Drop fields that map to an already-emitted register name.
+				// This happens on SVDs that use <alternateRegister> to expose
+				// the same physical register under multiple mode-specific names
+				// (e.g. N6 USART CR1_FIFO_ENABLED / CR1_FIFO_DISABLED, which
+				// both canonicalize to "CR1" after suffix stripping). Keeping
+				// both would emit duplicate struct fields and duplicate bit
+				// constants at package scope — a compile error.
+				if seenRegNames[f.Name] {
+					continue
+				}
+				seenRegNames[f.Name] = true
+				p.Registers = append(p.Registers, f)
+			}
 		}
 		peripheralsList = append(peripheralsList, processCluster(p, periphEl.Clusters, peripheralDict)...)
 	}
@@ -1165,9 +1184,37 @@ func (r *Register) size() int {
 	return 4
 }
 
-func parseRegister(groupName string, regEl *SVDRegister, baseAddress uint64, bitfieldPrefix string) []*PeripheralField {
+// stripPeripheralPrefix removes a leading "<peripheralName>_" from a register
+// name. Some STM32 SVDs (STM32N6, newer STM32U5) name registers with the
+// peripheral name prefixed literally (e.g. "GPIOA_MODER" instead of "MODER"),
+// which both produces awkward struct fields (`stm32.GPIOA.GPIOA_MODER`) and
+// prevents register structs from being shared across derived peripherals
+// (GPIOA, GPIOB, …). Stripping a matching leading prefix restores the cleaner
+// naming used by the rest of the stm32 device files. It's a no-op when the
+// register name doesn't start with the peripheral prefix.
+func stripPeripheralPrefix(regName, peripheralName string) string {
+	if peripheralName != "" {
+		regName = strings.TrimPrefix(regName, peripheralName+"_")
+	}
+	// CMSIS-SVD's `<alternateRegister>` is used to describe multiple field
+	// layouts for the same physical register, typically when the register
+	// behaves differently in different modes. ST's N6 USART uses this for
+	// FIFO-on vs FIFO-off layouts, naming them "CR1_FIFO_ENABLED" and
+	// "CR1_FIFO_DISABLED". The generator already drops the duplicate by
+	// address, but the surviving name keeps the mode suffix, preventing code
+	// that expects plain "CR1" from compiling. Strip the well-known suffixes
+	// so the canonical short name surfaces.
+	for _, suffix := range []string{"_FIFO_ENABLED", "_FIFO_DISABLED"} {
+		if strings.HasSuffix(regName, suffix) {
+			return strings.TrimSuffix(regName, suffix)
+		}
+	}
+	return regName
+}
+
+func parseRegister(peripheralName, groupName string, regEl *SVDRegister, baseAddress uint64, bitfieldPrefix string) []*PeripheralField {
 	reg := NewRegister(regEl, baseAddress)
-	name := reg.name()
+	name := stripPeripheralPrefix(reg.name(), peripheralName)
 	da := decodeDimArray(regEl.Dim, regEl.DimIndex, regEl.DimIncrement, "register", name)
 	if da != nil && strings.Contains(name, "%s") {
 		// a "spaced array" of registers, special processing required
@@ -1194,7 +1241,7 @@ func parseRegister(groupName string, regEl *SVDRegister, baseAddress uint64, bit
 		}
 		return results
 	}
-	regName := reg.name()
+	regName := stripPeripheralPrefix(reg.name(), peripheralName)
 	if !unicode.IsUpper(rune(regName[0])) && !unicode.IsDigit(rune(regName[0])) {
 		regName = strings.ToUpper(regName)
 	}

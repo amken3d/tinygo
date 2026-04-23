@@ -1,0 +1,9 @@
+{
+  "inherits": [
+    "stm32n657"
+  ],
+  "build-tags": [
+    "nucleon657"
+  ],
+  "serial": "uart"
+}
