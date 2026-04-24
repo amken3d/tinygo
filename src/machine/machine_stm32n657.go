@@ -18,6 +18,7 @@ func (uart *UART) configurePins(config UARTConfig) {
 // from its APB bus clock (PCLK1 for USART2/3/UART4-8, PCLK2 for USART1/6/10
 // and UART9, PCLK4 for LPUART1) which in our clock plan is PCLK1=PCLK2=150
 // MHz. OVER8=0 is the reset default, so BRR = fck / baud.
+// Ref: RM0486 pg 3298
 func (uart *UART) getBaudRateDivisor(baudRate uint32) uint32 {
 	return APB1_TIM_FREQ / baudRate
 }

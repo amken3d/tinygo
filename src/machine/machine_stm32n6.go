@@ -333,18 +333,22 @@ func handlePinInterrupt(pin uint8) {
 
 // ---------- Timer layer ----------
 
-// Bus and timer clocks match the chip's reset state: HSI drives CPUCLK and
-// SYSCLK directly, all bus prescalers are /1, all peripheral clocks gated
-// off. initCLK in runtime_stm32n6.go does not program PLL1 or the ICs, so
-// these values stay at 64 MHz until that changes.
+// Bus and timer clocks match the chip's reset state. HSI (64 MHz) drives
+// both CPUCLK and SYSCLK directly; RCC.CFGR2 resets with HPRE = /2 and
+// PPREx = /1, so after reset:
 //
-//	CPUCLK   64 MHz   (HSI)
-//	HCLK     64 MHz   (HPRE=1)
-//	PCLKx    64 MHz   (PPREx=1)
-//	TIMxCLK  64 MHz   (APBdiv=1 ⇒ PCLK)
+//	CPUCLK   64 MHz   (HSI, feeds the M55 core and SysTick)
+//	SYSCLK   64 MHz   (HSI)
+//	HCLK     32 MHz   (SYSCLK / HPRE=2)
+//	PCLKx    32 MHz   (HCLK / PPREx=1)
+//	TIMxCLK  32 MHz   (APBdiv=1 ⇒ equal to PCLK)
+//
+// initCLK in runtime_stm32n6.go leaves these at their reset values. If a
+// future change programs PLL1 / IC1 / the HPRE field, update these constants
+// and CPUFrequency() in lockstep.
 const (
-	APB1_TIM_FREQ = 64e6 // 64 MHz
-	APB2_TIM_FREQ = 64e6 // 64 MHz
+	APB1_TIM_FREQ = 32e6 // 32 MHz
+	APB2_TIM_FREQ = 32e6 // 32 MHz
 )
 
 func CPUFrequency() uint32 {
