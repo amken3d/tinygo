@@ -1089,6 +1089,14 @@ func Build(pkgName, outpath, tmpdir string, config *compileopts.Config) (BuildRe
 		if err != nil {
 			return result, err
 		}
+	case "stm32n6-fsbl":
+		// Wrap the ELF's raw binary with a signed STM32N6 FSBL v2.3 header so
+		// the N6 ROM bootloader will launch it from XSPI flash.
+		result.Binary = filepath.Join(tmpdir, "main"+outext)
+		err := signSTM32N6FSBL(result.Executable, result.Binary)
+		if err != nil {
+			return result, err
+		}
 	default:
 		return result, fmt.Errorf("unknown output binary format: %s", outputBinaryFormat)
 	}

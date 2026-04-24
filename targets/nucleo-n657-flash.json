@@ -1,0 +1,8 @@
+{
+  "inherits": [
+    "nucleo-n657"
+  ],
+  "binary-format": "stm32n6-fsbl",
+  "flash-method": "command",
+  "flash-command": "STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -el /opt/st/stm32cubeclt_1.21.0/STM32CubeProgrammer/bin/ExternalLoader/MX25UM51245G_STM32N6570-NUCLEO.stldr -w {bin} 0x70000000 -v -hardRst"
+}
