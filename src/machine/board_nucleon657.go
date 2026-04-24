@@ -43,3 +43,18 @@ var (
 func init() {
 	UART1.Interrupt = interrupt.New(stm32.IRQ_USART1, _UART1.handleInterrupt)
 }
+
+// USB identification strings + IDs used when the USB device stack is
+// brought up via machine.USBDev.Configure. 0x0483 is ST's assigned VID;
+// the PID is an arbitrary in-house value for development. Override by
+// setting usb.VendorID / usb.ProductID / usb.Manufacturer / usb.Product
+// from application code before calling Configure.
+const (
+	usb_STRING_PRODUCT      = "NUCLEO-N657"
+	usb_STRING_MANUFACTURER = "STMicroelectronics"
+)
+
+var (
+	usb_VID uint16 = 0x0483
+	usb_PID uint16 = 0x5740
+)

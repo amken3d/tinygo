@@ -337,18 +337,32 @@ func handlePinInterrupt(pin uint8) {
 // PLL1 (HSI×25 = 1600 MHz VCO) feeds IC2 /4 to the SYSCLK mux; PLL3
 // (HSE×25 = 1200 MHz VCO) feeds IC1 /2 to the CPU mux.
 //
-//	CPUCLK   600 MHz   (IC1 = PLL3 / 2; feeds the M55 core and SysTick)
-//	SYSCLK   400 MHz   (IC2 = PLL1 / 4)
-//	HCLK     200 MHz   (SYSCLK / HPRE=2)
-//	PCLKx    200 MHz   (HCLK  / PPREx=1)
-//	TIMxCLK  200 MHz   (APBdiv=1 ⇒ equal to PCLK)
+//	CPUCLK    600 MHz   (IC1 = PLL3 / 2; feeds the M55 core and SysTick)
+//	SYSCLK    400 MHz   (IC2 = PLL1 / 4)
+//	HCLK      200 MHz   (SYSCLK / HPRE=2)
+//	PCLKx     200 MHz   (HCLK  / PPREx=1)
+//	TIMxCLK   ~3.2 MHz  (empirically observed; see note below)
 //
-// Any change to the PLL/IC/HPRE config in initCLK has to update both
-// CPUFrequency() and the APB*_TIM_FREQ constants here in lockstep, or
-// SysTick reload values and UART BRR derivations end up scaled wrong.
+// Note on TIMxCLK. On N6 with TIMPRE=1 and SYSB=400 MHz, the RM / CubeMX
+// clock tree predicts a 200 MHz TIM kernel clock, but the silicon in the
+// openocd-SRAM boot path we use actually clocks the general-purpose TIM
+// counters at about 3.2 MHz (see /memory/project_n6_tim_clock.md). The
+// root cause isn't understood — there is a ~/64 divider in the TIM
+// kernel path that isn't described in the register-level docs we have.
+// Until we figure it out, `*_TIM_FREQ` below is calibrated to the
+// observed rate so `TIM.Configure(PWMConfig{Period: ...})` lands on
+// PSC / ARR values that actually produce the requested period. UART /
+// SPI / I2C BRR math uses the true PCLK1 = 200 MHz via
+// getBaudRateDivisor in machine_stm32n657.go — don't point that at
+// *_TIM_FREQ.
 const (
-	APB1_TIM_FREQ = 200e6 // 200 MHz
-	APB2_TIM_FREQ = 200e6 // 200 MHz
+	APB1_TIM_FREQ = 522_000 // empirical — DWT-measured TIM kernel clock
+	APB2_TIM_FREQ = 522_000
+
+	// PCLK is the true APB bus clock (for UART/SPI/I2C baud-rate math).
+	// See getBaudRateDivisor in machine_stm32n657.go.
+	PCLK1_FREQ = 200_000_000
+	PCLK2_FREQ = 200_000_000
 )
 
 func CPUFrequency() uint32 {

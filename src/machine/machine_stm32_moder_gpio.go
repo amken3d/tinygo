@@ -94,6 +94,14 @@ func (p Pin) ConfigureAltFunc(config PinConfig, altFunc uint8) {
 	case PinOutput:
 		port.MODER.ReplaceBits(gpioModeOutput, gpioModeMask, pos)
 		port.OSPEEDR.ReplaceBits(gpioOutputSpeedHigh, gpioOutputSpeedMask, pos)
+		// Force push-pull. After reset OTYPER is 0, but some boot-ROMs (observed
+		// on STM32N6 Nucleo: PG10 after XSPI ROM handoff) leave individual
+		// OTYPER bits set to open-drain. Without this write a pin that the user
+		// expects to actively drive high behaves as high-impedance when set
+		// high, so an LED or other push-pull-style load never actually gets
+		// driven. Mask is hard-coded 0x1 since some SVDs (stm32n657) mis-encode
+		// GPIO_OTYPER_OTx_Msk.
+		port.OTYPER.ReplaceBits(0, 0x1, pos/2)
 
 	// UART
 	case PinModeUARTTX:

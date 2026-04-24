@@ -76,6 +76,44 @@ func initCLK() {
 	arm.SCB.VTOR.Set(uint32(uintptr(unsafe.Pointer(&__isr_vector))))
 	arm.SCB.SCR.SetBits(1 << 4) // SEVONPEND
 
+	// --- Port of ST's SystemInit() board-prep: compensation cells + VDDIO
+	//     supply-valid bits ---------------------------------------------------
+	//
+	// N6 silicon errata ES0620 requires VDDIOxCCCR and VDDCCCR programmed to
+	// 0x287 before any pin runs at high speed; skipping this leaves the IO
+	// compensation cells disabled, which can cause flaky high-speed GPIO and
+	// (on some boards) a silent reset when peripherals drive their pins. The
+	// writes are gated by the SYSCFG clock, which is otherwise off.
+	//
+	// The SVMCRx.VDDIOxSV "supply valid" bits must also be set — they unlock
+	// access to the matching VDDIOxCCCR registers, and HAL's
+	// HAL_PWREx_EnableVddIO2/3/4/5 (invoked from MspInit) set exactly the
+	// same bits, so we don't need a separate call to mirror those.
+	//
+	// SVD naming vs ST HAL naming on the SYSCFG CCCR registers: our SVD
+	// labels them sequentially (VDDIO1..VDDIO4, VDDIOCCCR), ST's header
+	// labels the same offsets by domain number (VDDIO4/5/2/3, VDDCCCR).
+	// Offsets and the written value (0x287) are identical either way, so the
+	// domain each register actually compensates is dictated by the silicon,
+	// not the name.
+	stm32.RCC.APB4HENSR.Set(stm32.RCC_APB4HENR_SYSCFGEN)
+	_ = stm32.RCC.APB4HENR.Get()
+
+	stm32.SYSCFG.INITSVTORCR.Set(arm.SCB.VTOR.Get())
+
+	stm32.PWR.SVMCR1.SetBits(stm32.PWR_SVMCR1_VDDIO4SV)
+	stm32.PWR.SVMCR2.SetBits(stm32.PWR_SVMCR2_VDDIO5SV)
+	stm32.PWR.SVMCR3.SetBits(stm32.PWR_SVMCR3_VDDIO2SV | stm32.PWR_SVMCR3_VDDIO3SV)
+
+	stm32.SYSCFG.VDDIO1CCCR.Set(0x287)
+	stm32.SYSCFG.VDDIO2CCCR.Set(0x287)
+	stm32.SYSCFG.VDDIO3CCCR.Set(0x287)
+	stm32.SYSCFG.VDDIO4CCCR.Set(0x287)
+	stm32.SYSCFG.VDDIOCCCR.Set(0x287)
+
+	_ = stm32.SYSCFG.INITSVTORCR.Get()
+	stm32.RCC.APB4HENCR.Set(stm32.RCC_APB4HENCR_SYSCFGENC)
+
 	// --- Park CPU/SYS on HSI so we can reconfigure PLLs safely -----------
 	stm32.RCC.CR.SetBits(stm32.RCC_CR_HSION)
 	for stm32.RCC.SR.Get()&stm32.RCC_SR_HSIRDY == 0 {
@@ -144,8 +182,16 @@ func initCLK() {
 	for stm32.RCC.SR.Get()&stm32.RCC_SR_PLL3RDY == 0 {
 	}
 
-	// --- IC1 = PLL3 / 2 (CPU 600 MHz), IC2 = PLL1 / 4 (SYS 400 MHz) ------
+	// --- IC1 = PLL3/2 (CPU 600 MHz), IC2 = PLL1/4 (SYS 400 MHz),
+	//     IC6 = PLL1/2 (800 MHz), IC11 = PLL1/2 (800 MHz) ------------------
 	// SEL: 0=PLL1, 1=PLL2, 2=PLL3, 3=PLL4. INT = divider − 1.
+	//
+	// The SYSCLK mux value for "IC2_IC6_IC11" (RCC.CFGR1.SYSSW=3) requires
+	// all three IC outputs to be configured and enabled — HAL configures
+	// IC2+IC6+IC11 together whenever that SYS source is picked. Otherwise
+	// the TIM kernel-clock path (fed from one of IC6/IC11 on N6) sees
+	// whatever reset garbage those ICs were left in and runs orders of
+	// magnitude slower than expected.
 	stm32.RCC.IC1CFGR.Set(
 		(2 << stm32.RCC_IC1CFGR_IC1SEL_Pos) |
 			(1 << stm32.RCC_IC1CFGR_IC1INT_Pos),
@@ -154,10 +200,35 @@ func initCLK() {
 		(0 << stm32.RCC_IC2CFGR_IC2SEL_Pos) |
 			(3 << stm32.RCC_IC2CFGR_IC2INT_Pos),
 	)
-	stm32.RCC.DIVENSR.Set(stm32.RCC_DIVENR_IC1EN | stm32.RCC_DIVENR_IC2EN)
+	stm32.RCC.IC6CFGR.Set(
+		(0 << stm32.RCC_IC6CFGR_IC6SEL_Pos) |
+			(1 << stm32.RCC_IC6CFGR_IC6INT_Pos),
+	)
+	stm32.RCC.IC11CFGR.Set(
+		(0 << stm32.RCC_IC11CFGR_IC11SEL_Pos) |
+			(1 << stm32.RCC_IC11CFGR_IC11INT_Pos),
+	)
+	stm32.RCC.DIVENSR.Set(
+		stm32.RCC_DIVENR_IC1EN |
+			stm32.RCC_DIVENR_IC2EN |
+			stm32.RCC_DIVENR_IC6EN |
+			stm32.RCC_DIVENR_IC11EN,
+	)
 
-	// --- Bus prescalers: HPRE = /2 (encoded 1), PPREx = /1 (encoded 0) ---
-	stm32.RCC.CFGR2.Set(1 << stm32.RCC_CFGR2_HPRE_Pos)
+	// --- Bus prescalers: HPRE = /2 (encoded 1), PPREx = /1 (encoded 0),
+	// TIMPRE = 1 ---
+	//
+	// TIMPRE on N6 is a 2-bit field; HAL docs call its values DIV1/2/4/8
+	// but the CubeMX clock wizard for this board lands on value 1 with
+	// TIM kernel clock sourced from IC2 (= PLL1/4 = 400 MHz → 200 MHz
+	// after TIMPRE). Empirically, leaving TIMPRE at 0 lands TIM kernel
+	// at ~390 kHz instead of 200 MHz, so it isn't a simple divider —
+	// value 1 is required to route the TIM kernel through the normal
+	// path. Matching CubeMX's value here.
+	stm32.RCC.CFGR2.Set(
+		(1 << stm32.RCC_CFGR2_HPRE_Pos) |
+			(1 << stm32.RCC_CFGR2_TIMPRE_Pos),
+	)
 
 	// --- Switch CPU mux to IC1, SYS mux to IC2_IC6_IC11 (both encoded 3) -
 	cfgr1 = stm32.RCC.CFGR1.Get()
