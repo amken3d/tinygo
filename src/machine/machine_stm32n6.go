@@ -333,26 +333,26 @@ func handlePinInterrupt(pin uint8) {
 
 // ---------- Timer layer ----------
 
-// Bus and timer clocks match the chip's reset state. HSI (64 MHz) drives
-// both CPUCLK and SYSCLK directly; RCC.CFGR2 resets with HPRE = /2 and
-// PPREx = /1, so after reset:
+// Bus and timer clocks match what runtime_stm32n6.go's initCLK programs:
+// PLL1 (HSI×25 = 1600 MHz VCO) feeds IC2 /4 to the SYSCLK mux; PLL3
+// (HSE×25 = 1200 MHz VCO) feeds IC1 /2 to the CPU mux.
 //
-//	CPUCLK   64 MHz   (HSI, feeds the M55 core and SysTick)
-//	SYSCLK   64 MHz   (HSI)
-//	HCLK     32 MHz   (SYSCLK / HPRE=2)
-//	PCLKx    32 MHz   (HCLK / PPREx=1)
-//	TIMxCLK  32 MHz   (APBdiv=1 ⇒ equal to PCLK)
+//	CPUCLK   600 MHz   (IC1 = PLL3 / 2; feeds the M55 core and SysTick)
+//	SYSCLK   400 MHz   (IC2 = PLL1 / 4)
+//	HCLK     200 MHz   (SYSCLK / HPRE=2)
+//	PCLKx    200 MHz   (HCLK  / PPREx=1)
+//	TIMxCLK  200 MHz   (APBdiv=1 ⇒ equal to PCLK)
 //
-// initCLK in runtime_stm32n6.go leaves these at their reset values. If a
-// future change programs PLL1 / IC1 / the HPRE field, update these constants
-// and CPUFrequency() in lockstep.
+// Any change to the PLL/IC/HPRE config in initCLK has to update both
+// CPUFrequency() and the APB*_TIM_FREQ constants here in lockstep, or
+// SysTick reload values and UART BRR derivations end up scaled wrong.
 const (
-	APB1_TIM_FREQ = 32e6 // 32 MHz
-	APB2_TIM_FREQ = 32e6 // 32 MHz
+	APB1_TIM_FREQ = 200e6 // 200 MHz
+	APB2_TIM_FREQ = 200e6 // 200 MHz
 )
 
 func CPUFrequency() uint32 {
-	return 64_000_000
+	return 600_000_000
 }
 
 // Point TIM EnableRegister at the ENSR aliases so the shared
