@@ -376,14 +376,16 @@ func UVCStats() {
 }
 
 // EnableUVC configures the N6 USB stack as a single-format UVC webcam
-// (160×120 YUY2 @ 15 fps). Call AFTER USBDev.Configure() and INSTEAD of
-// usbcdc.EnableUSBCDC().
+// (160×120 YUY2 @ 15 fps). Call BEFORE USBDev.Configure() and INSTEAD of
+// usbcdc.EnableUSBCDC(). Order matters: USBDev.Configure() releases the
+// USB bus and the host enumerates immediately, so the VID/PID + descriptor
+// pointers must be in their final state by then.
 func EnableUVC() {
 	uvcPatchLengths()
 
 	// Override the board-default PID (0x5740 == CDC ACM) with our UVC PID.
 	// sendDescriptor() patches usbDescriptor.Device with usb_VID/usb_PID
-	// every time the host queries DEVICE, so just rewriting the bytes in
+	// on every GET_DESCRIPTOR(DEVICE), so just rewriting the bytes in
 	// uvcDeviceDesc isn't enough.
 	usb_PID = 0x5741
 

@@ -50,7 +50,7 @@ func init() {
 // setting usb.VendorID / usb.ProductID / usb.Manufacturer / usb.Product
 // from application code before calling Configure.
 const (
-	usb_STRING_PRODUCT      = "NUCLEO-N657"
+	usb_STRING_PRODUCT      = "Tinygo uvc driver on NUCLEO-N657"
 	usb_STRING_MANUFACTURER = "STMicroelectronics"
 )
 
