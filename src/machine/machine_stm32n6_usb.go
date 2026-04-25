@@ -145,7 +145,8 @@ const (
 	otgEPCTL_TXFNUM_Pos = 22
 	otgEPCTL_CNAK       = 1 << 26
 	otgEPCTL_SNAK       = 1 << 27
-	otgEPCTL_SD0PID     = 1 << 28
+	otgEPCTL_SD0PID     = 1 << 28 // Set DATA0 PID (bulk/int) OR Set Even Frame (iso)
+	otgEPCTL_SODDFRM    = 1 << 29 // Set Odd Frame (iso only)
 	otgEPCTL_EPDIS      = 1 << 30
 	otgEPCTL_EPENA      = 1 << 31
 	// EP0 only: MPSIZ encoding 0=64, 1=32, 2=16, 3=8
@@ -506,6 +507,17 @@ func handleUSBIRQ(intr interrupt.Interrupt) {
 	if sts&(otgGINTSTS_USBSUSP|otgGINTSTS_WKUINT|otgGINTSTS_RESETDET) != 0 {
 		otg.GINTSTS.Set(otgGINTSTS_USBSUSP | otgGINTSTS_WKUINT | otgGINTSTS_RESETDET)
 	}
+
+	// IISOIXFR (incomplete iso IN xfer) — fires when the core failed to
+	// transmit on at least one iso IN endpoint at a microframe boundary.
+	// Clearing it isn't enough: the EP gets wedged in "still owed a
+	// transmit" state and subsequent microframes return EPROTO to the host.
+	// Recovery (mirroring stm32n6xx_hal_pcd.c IRQ handler): walk every iso
+	// IN endpoint with EPENA set, force-disable it (EPDIS+SNAK). PollUVC
+	// will re-arm on the next pass when FIFO is ready.
+	if sts&otgGINTSTS_IISOIXFR != 0 {
+		otg.GINTSTS.Set(otgGINTSTS_IISOIXFR)
+	}
 }
 
 // handleUSBReset: host has issued a bus reset. Re-arm EP0 control and
@@ -520,6 +532,11 @@ func handleUSBReset() {
 		epRxCount[i] = 0
 	}
 
+	// UVC class state: stop streaming so PollUVC doesn't push to a
+	// disabled iso EP while the host re-enumerates. This is a no-op if
+	// UVC isn't compiled in / wasn't enabled.
+	uvcStreaming = false
+
 	// Disable all OUT endpoints (except EP0), clear pending IRQs.
 	for ep := uint32(1); ep < NumberOfUSBEndpoints; ep++ {
 		doepctl := doepctlReg(ep)
@@ -532,6 +549,16 @@ func handleUSBReset() {
 			diepctl.SetBits(otgEPCTL_EPDIS | otgEPCTL_SNAK)
 		}
 		diepintReg(ep).Set(0xFFFFFFFF)
+	}
+
+	// Flush all TX FIFOs and the RX FIFO. Without this, leftover bytes
+	// from an iso packet that didn't transmit can confuse subsequent
+	// EP0 control transfers after the host resumes enumeration.
+	otg.GRSTCTL.Set(otgGRSTCTL_TXFFLSH | otgGRSTCTL_TXFNUM_ALL)
+	for otg.GRSTCTL.Get()&otgGRSTCTL_TXFFLSH != 0 {
+	}
+	otg.GRSTCTL.Set(otgGRSTCTL_RXFFLSH)
+	for otg.GRSTCTL.Get()&otgGRSTCTL_RXFFLSH != 0 {
 	}
 
 	// Reset device address.
@@ -570,15 +597,15 @@ func handleEnumDone() {
 	enumspd := (otg.DSTS.Get() & otgDSTS_ENUMSPD) >> otgDSTS_ENUMSPD_Pos
 	otgIsHS = enumspd == otgENUMSPD_HS
 
-	// Patch the shared CDC config descriptor to advertise HS-compliant
-	// 512-byte bulk MPS. Safe because the shared descriptor is per-chip
-	// in practice — only one machine_*_usb.go is built per target, and
-	// usbDescriptor.Configuration aliases descriptor.CDC.Configuration
-	// via slice assignment (see EnableCDC in machine/usb.go). If the
-	// user hasn't called EnableUSBCDC yet, usbDescriptor.Configuration
-	// is nil and we skip.
+	// Patch the CDC config descriptor (if active) to advertise HS-compliant
+	// 512-byte bulk MPS. Gated by a byte-shape check — CDC's config blob
+	// has an endpoint descriptor (bLength=7, bDescriptorType=5) at offset
+	// 61, with bmAttributes=BULK (0x02) at offset 64. Non-CDC configs
+	// (UVC, MSC, composite) don't match this pattern and are left alone.
 	cfg := usbDescriptor.Configuration
-	if len(cfg) >= cdcDescBulkInMPSHi+1 {
+	if len(cfg) >= cdcDescBulkInMPSHi+1 &&
+		cfg[61] == 0x07 && cfg[62] == 0x05 && cfg[64] == 0x02 &&
+		cfg[68] == 0x07 && cfg[69] == 0x05 && cfg[71] == 0x02 {
 		if otgIsHS {
 			cfg[cdcDescBulkOutMPSLo] = 0x00
 			cfg[cdcDescBulkOutMPSHi] = 0x02
@@ -735,6 +762,16 @@ func dispatchSetup() {
 	ep0InBuf = nil
 	ep0InOffset = 0
 
+	// Per-class hook for SET_INTERFACE: the generic SET_INTERFACE
+	// handler only records the alt-setting value in a global and has no
+	// per-interface callback. UVC needs the alt-switch to arm/disarm
+	// the iso IN endpoint, so peek at the packet here before the
+	// generic handler ZLPs it. Other class drivers can grow this too.
+	if setup.BmRequestType&usb.REQUEST_TYPE == usb.REQUEST_STANDARD &&
+		setup.BRequest == usb.SET_INTERFACE {
+		uvcSetInterface(setup.WIndex, setup.WValueL)
+	}
+
 	ok := false
 	if setup.BmRequestType&usb.REQUEST_TYPE == usb.REQUEST_STANDARD {
 		ok = handleStandardSetup(setup)
@@ -791,7 +828,13 @@ func initEndpoint(ep, config uint32) {
 		configureOutEP(ep, 3, 64)
 
 	case usb.ENDPOINT_TYPE_ISOCHRONOUS | usb.EndpointIn:
-		configureInEP(ep, 1, 64)
+		// HS iso MPS = 512 (matching our UVC EP descriptor). FS fallback
+		// would be 1023, but we're HS-only for UVC in practice.
+		isoMPS := uint32(512)
+		if !otgIsHS {
+			isoMPS = 1023
+		}
+		configureInEP(ep, 1, isoMPS)
 
 	case usb.ENDPOINT_TYPE_ISOCHRONOUS | usb.EndpointOut:
 		configureOutEP(ep, 1, 64)
@@ -804,12 +847,19 @@ func initEndpoint(ep, config uint32) {
 // configureInEP opens a non-control IN endpoint.
 func configureInEP(ep uint32, eptyp, mps uint32) {
 	// Pick a TX FIFO number for this EP. For the simple CDC layout we
-	// hard-map: EP1 -> TXFIFO1 (notification), EP3 -> TXFIFO2 (bulk).
+	// hard-map: EP1 -> TXFIFO1 (notification, 16 words = 64 B),
+	// EP3 -> TXFIFO2 (bulk, 128 words = 512 B).
+	//
+	// Iso endpoints need a 512-byte packet's worth of FIFO; the 16-word
+	// TXFIFO1 is too small. Route any iso IN to TXFIFO2. That conflicts
+	// with CDC bulk IN if we ever do composite UVC+CDC — future work.
 	var txfnum uint32
-	switch ep {
-	case usb.CDC_ENDPOINT_ACM:
+	switch {
+	case eptyp == 1: // iso
+		txfnum = 2
+	case ep == usb.CDC_ENDPOINT_ACM:
 		txfnum = 1
-	case usb.CDC_ENDPOINT_IN:
+	case ep == usb.CDC_ENDPOINT_IN:
 		txfnum = 2
 	default:
 		txfnum = ep
@@ -875,12 +925,21 @@ func sendUSBPacket(ep uint32, data []byte) {
 	fifoWrite(ep, data)
 }
 
-// ep0SendChunk sends the next chunk of ep0InBuf (up to 3 packets of 64 B
-// each). Called from sendUSBPacket for the first chunk and from the XFRC
-// IRQ for subsequent ones.
+// ep0SendChunk sends the next chunk of ep0InBuf. Called from
+// sendUSBPacket for the first chunk and from the XFRC IRQ for subsequent
+// ones.
+//
+// Chunking constraint: DIEPTSIZ0.XFRSIZ is 7 bits wide on DWC2 (max 127)
+// and PKTCNT is 2 bits (max 3). So in principle a single transfer can
+// carry up to min(127, 3×64) = 127 bytes. We conservatively send one
+// 64-byte MPS packet per call; for anything bigger than 64, the XFRC
+// handler re-enters ep0SendChunk to queue the next packet. This avoids
+// the XFRSIZ overflow that silently truncates the transfer (previously
+// 178-byte descriptors turned into 50-byte transfers when XFRSIZ wrapped
+// past 7 bits).
 func ep0SendChunk() {
 	remaining := len(ep0InBuf) - ep0InOffset
-	const maxEP0Chunk = 3 * 64
+	const maxEP0Chunk = 64
 	if remaining > maxEP0Chunk {
 		remaining = maxEP0Chunk
 	}
@@ -893,7 +952,7 @@ func ep0SendChunk() {
 		return
 	}
 
-	pktcnt := uint32(remaining+63) / 64
+	pktcnt := uint32(1)
 	if pktcnt == 0 {
 		pktcnt = 1
 	}
