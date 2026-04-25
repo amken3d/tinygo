@@ -11,19 +11,25 @@ package machine
 //   - Each IN endpoint has its own TX FIFO; data is pushed via DFIFO[ep].
 //   - DFIFO register windows start at core+0x1000 with 0x1000-byte stride.
 //
-// Current state: Full-Speed on the integrated HS PHY. DCFG.DSPD=1 (not 3 —
-// N6 has no separate FS-only PHY). PHY reference clock is CLKP at 20 MHz,
-// routed from PLL1 / IC5 / CLKP — matches ST's CubeMX NUCLEO-N657 config.
-// VDDUSB (PWR.SVMCR3.USB33SV) must be enabled before the PHY will drive
-// the bus.
+// Current state: High-Speed on the integrated HS PHY (DCFG.DSPD=0). Also
+// works at Full-Speed if negotiated down by a FS-only hub. PHY reference
+// clock is CLKP at 20 MHz, routed from PLL1 / IC5 / CLKP — matches ST's
+// CubeMX NUCLEO-N657 config. VDDUSB (PWR.SVMCR3.USB33SV) must be enabled
+// before the PHY will drive the bus.
+//
+// HS bulk MPS is 512 (USB spec mandates); the generic CDC config
+// descriptor in machine/usb/descriptor hardcodes 64-byte bulk. When the
+// core enumerates at HS, handleEnumDone patches the four relevant bytes
+// of the shared descriptor blob to 0x0200 before the host queries
+// GET_DESCRIPTOR(CONFIG). In FS mode the descriptor is left alone.
 //
 // Servicing: currently polled from the main loop via PollUSB(). The
 // NVIC-dispatched path is wired up but the OTG1 hardware IRQ doesn't
 // fire reliably on this chip — root cause unknown; polling on a 600 MHz
 // M55 is cheap enough that this is not blocking. See PollUSB().
 //
-// Scope: no DMA, no host mode, no SOF handling, no HS signalling, no iso
-// endpoints. CDC-ACM works; MSC / UVC / HS are future phases.
+// Scope: no DMA, no host mode, no SOF handling, no iso endpoints.
+// CDC-ACM works at HS/FS; MSC / UVC are future phases.
 
 import (
 	"device/arm"
@@ -104,19 +110,32 @@ const (
 
 	// DCFG / DCTL / DSTS. DSPD encoding on the N6 HS-embedded PHY:
 	//   0 = High-speed
-	//   1 = Full-speed (using internal HS PHY) ← what N6 wants for FS
+	//   1 = Full-speed (using internal HS PHY) ← N6 FS path
 	//   3 = Full-speed (dedicated FS PHY, not present on N6)
-	otgDCFG_DSPD_HS = 0
-	otgDCFG_DSPD_FS = 1
-	otgDCFG_DAD_Pos = 4
-	otgDCFG_DAD_Msk = 0x7F << 4
-	otgDCTL_RWUSIG  = 1 << 0
-	otgDCTL_SDIS    = 1 << 1
-	otgDCTL_SGINAK  = 1 << 7
-	otgDCTL_CGINAK  = 1 << 8
-	otgDCTL_SGONAK  = 1 << 9
-	otgDCTL_CGONAK  = 1 << 10
-	otgDSTS_ENUMSPD = 0x3 << 1
+	otgDCFG_DSPD_HS     = 0
+	otgDCFG_DSPD_FS     = 1
+	otgDCFG_DAD_Pos     = 4
+	otgDCFG_DAD_Msk     = 0x7F << 4
+	otgDCTL_RWUSIG      = 1 << 0
+	otgDCTL_SDIS        = 1 << 1
+	otgDCTL_SGINAK      = 1 << 7
+	otgDCTL_CGINAK      = 1 << 8
+	otgDCTL_SGONAK      = 1 << 9
+	otgDCTL_CGONAK      = 1 << 10
+	otgDSTS_ENUMSPD     = 0x3 << 1
+	otgDSTS_ENUMSPD_Pos = 1
+	// ENUMSPD values (device mode): 0=HS PHY@30MHz, 1=FS PHY@30MHz,
+	// 3=FS PHY@48MHz (not used on N6), 2=LS (not used).
+	otgENUMSPD_HS = 0
+	otgENUMSPD_FS = 1
+
+	// CDC config-descriptor byte offsets (assembled layout; see
+	// machine/usb/descriptor/cdc.go). Used by handleEnumDone to patch
+	// bulk MPS to HS-compliant 512 bytes when we enumerate at HS.
+	cdcDescBulkOutMPSLo = 65 // EndpointEP2OUT.wMaxPacketSize[0]
+	cdcDescBulkOutMPSHi = 66
+	cdcDescBulkInMPSLo  = 72 // EndpointEP3IN.wMaxPacketSize[0]
+	cdcDescBulkInMPSHi  = 73
 
 	// DIEPCTL / DOEPCTL shared bits
 	otgEPCTL_USBAEP     = 1 << 15
@@ -156,22 +175,24 @@ const (
 	otgDAINTMSK_OEP_Pos = 16
 )
 
-// FIFO sizing (in 32-bit words). Must fit the core's dedicated RAM; for
-// the N6 OTG1 FS path the RAM budget is at least 1.25 KB of words. We lay
-// out:
+// FIFO sizing (in 32-bit words). Must fit the core's dedicated RAM (N6
+// OTG1 HS core: ≥4 KB = 1024 words per ST's databook). Sized for HS
+// CDC-ACM (one 512-byte bulk-out packet inbound, one 512-byte bulk-in
+// outbound):
 //
-//	RX shared:            128 words (=512 B) — enough for one bulk-out + EP0 setup overhead.
-//	EP0 TX (non-periodic): 32 words (=128 B)
-//	EP1 TX (CDC notif IN): 16 words  (= 64 B)
-//	EP2 TX (CDC data IN):  64 words  (=256 B)
+//	RX shared:            256 words (=1 KB) — fits one HS bulk-out packet
+//	                                           + SETUP overhead + margin
+//	EP0 TX (non-periodic): 32 words (=128 B)  — EP0 MPS is 64 in HS and FS
+//	EP1 TX (CDC notif IN): 16 words  (= 64 B) — 10-byte notification
+//	EP2 TX (CDC data IN): 128 words  (=512 B) — one HS bulk-in packet
 //	others: 0
 //
 // Addresses are expressed as (depth << 16) | start, same word units.
 const (
-	otgRXFIFO_DEPTH  = 128
+	otgRXFIFO_DEPTH  = 256
 	otgTXFIFO0_DEPTH = 32
 	otgTXFIFO1_DEPTH = 16
-	otgTXFIFO2_DEPTH = 64
+	otgTXFIFO2_DEPTH = 128
 )
 
 // FIFO memory window access. On DWC2 the FIFO RAM is mapped at core+0x1000
@@ -207,15 +228,19 @@ var endPoints = []uint32{
 	8:                     usb.ENDPOINT_TYPE_DISABLE,
 }
 
-// Per-endpoint OUT staging. Setup packets are 8 bytes; bulk-out is at
-// most one 64-byte packet per transfer in this driver. We copy out of the
-// FIFO into these buffers in the RXFLVL handler, then dispatch on XFRC.
+// Per-endpoint OUT staging. Setup packets are 8 bytes; bulk-out on HS
+// can be up to 512 bytes per transfer. We copy out of the FIFO into
+// these buffers in the RXFLVL handler, then dispatch on XFRC.
 var (
 	setupPkt   [8]byte
 	setupReady bool
 
-	epRxBuffer [NumberOfUSBEndpoints][64]byte
+	epRxBuffer [NumberOfUSBEndpoints][512]byte
 	epRxCount  [NumberOfUSBEndpoints]uint16
+
+	// otgIsHS is set by handleEnumDone when the core reports HS on the
+	// bus. Consumed by bulkMPS() and by the descriptor-patch logic.
+	otgIsHS bool
 
 	// Pending IN to complete on EP0 data stage (descriptor transfer, etc.).
 	// The generic dispatcher hands us the full payload in one sendUSBPacket
@@ -355,11 +380,13 @@ func (dev *USBDevice) Configure(config UARTConfig) {
 	// clears STPPCLK + GATEHCLK if left set by a prior suspend.
 	otg.PCGCCTL.Set(0)
 
-	// Set device speed. For the HS-embedded PHY, "FS" is encoded as
-	// USB_OTG_SPEED_HIGH_IN_FULL (DSPD=1). HAL: `USBx_DEVICE->DCFG |= speed;`
+	// Set device speed. DSPD=0 advertises HS; the host will negotiate HS
+	// if its hub supports it, otherwise it'll enumerate at FS via the
+	// chirp-J/K sequence and we'll see that in DSTS.ENUMSPD after
+	// ENUMDNE fires.
 	dcfg := otg.DCFG.Get()
 	dcfg &^= 0x3
-	dcfg |= otgDCFG_DSPD_FS
+	dcfg |= otgDCFG_DSPD_HS
 	otg.DCFG.Set(dcfg)
 
 	// --- FIFO layout ---------------------------------------------------
@@ -521,8 +548,15 @@ func handleUSBReset() {
 	initEndpoint(0, usb.ENDPOINT_TYPE_CONTROL)
 }
 
-// handleEnumDone: speed negotiated. We programmed FS so just keep EP0
-// at 64-byte MPS. If we ever flip to HS we'd clamp/adjust here.
+// handleEnumDone runs after speed negotiation. EP0 MPS stays at 64 in
+// both HS and FS. The core also leaves NAK asserted after reset; clear
+// it so the endpoints can actually transmit/receive.
+//
+// We latch the negotiated speed from DSTS.ENUMSPD into otgIsHS so
+// bulkMPS() returns the correct value for later SET_CONFIGURATION. When
+// HS is negotiated, we also patch the CDC config-descriptor blob in
+// machine/usb/descriptor so the host sees spec-compliant 512-byte bulk
+// wMaxPacketSize on its subsequent GET_DESCRIPTOR(CONFIG).
 func handleEnumDone() {
 	diepctl := diepctlReg(0)
 	v := diepctl.Get()
@@ -532,6 +566,41 @@ func handleEnumDone() {
 
 	// Clear global IN/OUT NAK (core reset leaves them set).
 	otg.DCTL.SetBits(otgDCTL_CGINAK | otgDCTL_CGONAK)
+
+	enumspd := (otg.DSTS.Get() & otgDSTS_ENUMSPD) >> otgDSTS_ENUMSPD_Pos
+	otgIsHS = enumspd == otgENUMSPD_HS
+
+	// Patch the shared CDC config descriptor to advertise HS-compliant
+	// 512-byte bulk MPS. Safe because the shared descriptor is per-chip
+	// in practice — only one machine_*_usb.go is built per target, and
+	// usbDescriptor.Configuration aliases descriptor.CDC.Configuration
+	// via slice assignment (see EnableCDC in machine/usb.go). If the
+	// user hasn't called EnableUSBCDC yet, usbDescriptor.Configuration
+	// is nil and we skip.
+	cfg := usbDescriptor.Configuration
+	if len(cfg) >= cdcDescBulkInMPSHi+1 {
+		if otgIsHS {
+			cfg[cdcDescBulkOutMPSLo] = 0x00
+			cfg[cdcDescBulkOutMPSHi] = 0x02
+			cfg[cdcDescBulkInMPSLo] = 0x00
+			cfg[cdcDescBulkInMPSHi] = 0x02
+		} else {
+			cfg[cdcDescBulkOutMPSLo] = 0x40
+			cfg[cdcDescBulkOutMPSHi] = 0x00
+			cfg[cdcDescBulkInMPSLo] = 0x40
+			cfg[cdcDescBulkInMPSHi] = 0x00
+		}
+	}
+}
+
+// bulkMPS returns the maximum-packet-size for bulk endpoints in the
+// currently-negotiated speed. Valid only after handleEnumDone has run;
+// defaults to the FS value before then.
+func bulkMPS() uint32 {
+	if otgIsHS {
+		return 512
+	}
+	return 64
 }
 
 // drainRxFifo pops every packet currently in the shared RX FIFO and
@@ -708,12 +777,14 @@ func initEndpoint(ep, config uint32) {
 		armEP0Out()
 
 	case usb.ENDPOINT_TYPE_BULK | usb.EndpointIn:
-		configureInEP(ep, 2, 64) // EPTYP=2 (bulk), MPS=64
+		configureInEP(ep, 2, bulkMPS()) // EPTYP=2 (bulk); MPS tracks speed
 
 	case usb.ENDPOINT_TYPE_BULK | usb.EndpointOut:
-		configureOutEP(ep, 2, 64)
+		configureOutEP(ep, 2, bulkMPS())
 
 	case usb.ENDPOINT_TYPE_INTERRUPT | usb.EndpointIn:
+		// Interrupt MPS is application-chosen; 64 is fine for CDC's
+		// 10-byte notification packet at either HS or FS.
 		configureInEP(ep, 3, 64)
 
 	case usb.ENDPOINT_TYPE_INTERRUPT | usb.EndpointOut:
@@ -867,14 +938,16 @@ func handleEndpointRx(ep uint32) []byte {
 
 // AckUsbOutTransfer re-arms a non-control OUT endpoint for the next MPS-
 // sized packet. Generic stack calls this after the RX handler consumes
-// what handleEndpointRx returned.
+// what handleEndpointRx returned. Uses the endpoint's configured MPSIZ
+// field from DOEPCTL so HS (512) and FS (64) bulk both work.
 func AckUsbOutTransfer(ep uint32) {
 	if ep == 0 {
 		armEP0Out()
 		return
 	}
 	epRxCount[ep] = 0
-	doeptsizReg(ep).Set((1 << otgDIEPTSIZ_PKTCNT_Pos) | 64)
+	mps := doepctlReg(ep).Get() & 0x7FF // MPSIZ[10:0]
+	doeptsizReg(ep).Set((1 << otgDIEPTSIZ_PKTCNT_Pos) | mps)
 	doepctlReg(ep).SetBits(otgEPCTL_EPENA | otgEPCTL_CNAK)
 }
 
