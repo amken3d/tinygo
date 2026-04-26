@@ -405,25 +405,44 @@ func EnableUVC() {
 		usbRxHandler[i] = nil
 	}
 
+	// Register the iso EP1 IN tx handler — fires from handleIEPInt on
+	// XFRC and queues the next packet. Driving the iso refill from the
+	// XFRC IRQ instead of polling DTXFSTS is necessary on this core:
+	// DTXFSTS only releases 1 word per iso transfer, not the full
+	// MPS-worth, so a "wait until DTXFSTS >= MPS" scheme deadlocks
+	// after the first packet.
+	usbTxHandler[uvcIsoEP] = uvcOnEP1XFRC
+
 	// Register VS interface class-request handler.
 	usbSetupHandler[uvcVSInterface] = uvcVSSetup
 	usbSetupHandler[uvcVCInterface] = nil
 }
 
-// PollUVC pushes one iso IN packet if streaming is active and there's
-// FIFO space. Call this alongside PollUSB() in the main loop.
-//
-// DTXFSTSn is indexed by *endpoint number* — reports free space in
-// whichever TX FIFO the endpoint is assigned to via DIEPCTL.TXFNUM.
+// uvcOnEP1XFRC is invoked in IRQ context from handleIEPInt whenever the
+// iso IN endpoint completes a transfer. Refills the next packet
+// immediately so the EP stays armed across consecutive microframes.
+func uvcOnEP1XFRC() {
+	if !uvcStreaming {
+		return
+	}
+	uvcSendPacket()
+}
+
+// PollUVC is now a no-op safety wrapper. The iso refill path is driven
+// by the XFRC IRQ via uvcOnEP1XFRC; calling this from the main loop
+// merely enters the streaming/EPENA gate and returns. Kept for backward
+// compatibility with mains that still call it.
 func PollUVC() {
 	if !uvcStreaming {
 		return
 	}
 	uvcNPolls++
-	// uvcIsoMPS = 512 B = 128 words — need that much free.
-	if otg.DTXFSTS1.Get() < uvcIsoMPS/4 {
+	// If EP is already armed, IRQ path will refill on completion.
+	if diepctlReg(uvcIsoEP).Get()&otgEPCTL_EPENA != 0 {
 		return
 	}
+	// EP not armed and streaming on — kick a packet (handles the very
+	// first send too, though uvcSetInterface already primes).
 	uvcSendPacket()
 }
 
@@ -455,32 +474,34 @@ func uvcSendPacket() {
 
 	totalLen := uint32(n + 2)
 
-	// Program the IN transfer: one packet, MCNT=1 (iso single-pkt-per-µf).
+	// Per RM0486 73.15.6 "IN data transfers / Packet write":
+	//   1. Program DIEPTSIZ (transfer size + packet count + multi-count)
+	//   2. RMW DIEPCTL to set EPENA + CNAK + iso frame-parity hint
+	//      (preserving MPSIZ, EPTYP, TXFNUM, USBAEP from EP activation)
+	//   3. Write the complete packet's data to the TX FIFO
+	// Step 2 must happen BEFORE step 3 — that's the RM-prescribed order.
 	dieptsizReg(uvcIsoEP).Set(
 		(1 << otgDIEPTSIZ_PKTCNT_Pos) | // PKTCNT=1
-			(1 << 29) | // MCNT=1
+			(1 << 29) | // MCNT=01 (1 packet/µframe)
 			totalLen, // XFRSIZ
 	)
 
-	// Push data to FIFO BEFORE arming EPENA. If we arm first then push,
-	// a µframe boundary arriving between the two operations would cause
-	// the core to transmit a 0-byte packet (FIFO empty) — visible to the
-	// host as a successful 0-length iso IN, leading to "no usable data"
-	// frames at the V4L2 layer.
-	fifoWrite(uvcIsoEP, uvcPacket[:totalLen])
-
-	// Iso endpoints need a microframe-parity hint. For 1 packet/µframe
-	// the safe approach is "always next", which we encode by checking
-	// the current frame counter's LSB and setting the OPPOSITE parity.
-	// DSTS bits [21:8] are FNSOF; bit 8 = LSB of microframe number on HS.
+	// Iso parity: program EONUM (bit 16, read-only) via SODDFRM (bit 29)
+	// or SEVNFRM (bit 28, named SD0PID in the SVD). Target the upcoming
+	// microframe's parity = opposite of current FNSOF[0] in DSTS bit 8.
 	even := otg.DSTS.Get()&(1<<8) == 0
 	var parityBit uint32
 	if even {
-		parityBit = otgEPCTL_SODDFRM
+		parityBit = otgEPCTL_SODDFRM // upcoming µf is odd
 	} else {
-		parityBit = otgEPCTL_SD0PID // = SEVNFRM for iso
+		parityBit = otgEPCTL_SD0PID // = SEVNFRM, upcoming µf is even
 	}
 	diepctlReg(uvcIsoEP).SetBits(otgEPCTL_EPENA | otgEPCTL_CNAK | parityBit)
+
+	// Now push the complete packet's bytes into the TX FIFO. Per RM,
+	// the full payload must be present BEFORE the IN token arrives —
+	// otherwise the core sends a 0-byte iso IN.
+	fifoWrite(uvcIsoEP, uvcPacket[:totalLen])
 
 	// Advance frame position; on frame boundary flip FID.
 	uvcFrameOff += uint32(n)
@@ -620,25 +641,21 @@ func uvcRecvProbe(length int) ([]byte, error) {
 
 // uvcSetInterface is called by the main USB dispatch when a
 // SET_INTERFACE targeting the VS interface arrives. Alt 0 = idle,
-// alt 1 = streaming (arm the iso IN endpoint).
+// alt 1 = streaming.
 func uvcSetInterface(ifaceNum uint16, alt uint8) {
 	if ifaceNum != uvcVSInterface {
 		return
 	}
 	uvcNSetInterface++
-	if alt == 0 {
-		uvcStreaming = false
-		uvcFrameOff = 0
-		uvcFrameIndex = 0
-		// Disable iso IN; the generic SET_INTERFACE ZLP is sent separately.
-		diepctlReg(uvcIsoEP).ClearBits(otgEPCTL_EPENA)
-		return
-	}
-	// alt == 1 (or higher — we only have alt 1).
+
+	uvcStreaming = false
 	uvcFrameOff = 0
 	uvcFrameIndex = 0
+
+	if alt == 0 {
+		return
+	}
+	// alt == 1 — start streaming. PollUVC (and/or the EP1 XFRC handler)
+	// will arm and refill the iso EP from here on.
 	uvcStreaming = true
-	// Configure endpoint once; initEndpoint was already called from the
-	// generic SET_CONFIGURATION handler. No-op here — PollUVC() will kick
-	// the first packet.
 }
