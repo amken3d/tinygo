@@ -363,16 +363,18 @@ var (
 // UVCStats prints counters for all UVC class requests seen since boot.
 // Useful for diagnosing host/device probe-commit negotiation.
 func UVCStats() {
-	println("uvc: reqs=", uvcNReqs,
-		" getInfo=", uvcNGetInfo, " getLen=", uvcNGetLen, " getCur=", uvcNGetCur,
-		" getMinMax=", uvcNGetMinMax, " getDef=", uvcNGetDef,
-		" setCurProbe=", uvcNSetCurProbe, " setCurCommit=", uvcNSetCurCommit,
-		" setIface=", uvcNSetInterface,
-		" setCurOk=", uvcNSetCurOk, " setCurTimeo=", uvcNSetCurTimeo)
-	println("uvc: pumps polls=", uvcNPolls,
-		" sendsIn=", uvcNSendsEntered, " sendsOut=", uvcNSendsExited)
-	println("uvc: last bReq=", uvcLastBReq, " cs=", uvcLastWValueH, " wLen=", uvcLastWLength)
-	println("uvc: streaming=", uvcStreaming, " frameOff=", uvcFrameOff, " tick=", uvcTickCount)
+	if uvcStreaming {
+		println("uvc: reqs=", uvcNReqs,
+			" getInfo=", uvcNGetInfo, " getLen=", uvcNGetLen, " getCur=", uvcNGetCur,
+			" getMinMax=", uvcNGetMinMax, " getDef=", uvcNGetDef,
+			" setCurProbe=", uvcNSetCurProbe, " setCurCommit=", uvcNSetCurCommit,
+			" setIface=", uvcNSetInterface,
+			" setCurOk=", uvcNSetCurOk, " setCurTimeo=", uvcNSetCurTimeo)
+		println("uvc: pumps polls=", uvcNPolls,
+			" sendsIn=", uvcNSendsEntered, " sendsOut=", uvcNSendsExited)
+		println("uvc: last bReq=", uvcLastBReq, " cs=", uvcLastWValueH, " wLen=", uvcLastWLength)
+		println("uvc: streaming=", uvcStreaming, " frameOff=", uvcFrameOff, " tick=", uvcTickCount)
+	}
 }
 
 // EnableUVC configures the N6 USB stack as a single-format UVC webcam

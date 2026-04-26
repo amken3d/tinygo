@@ -508,15 +508,61 @@ func handleUSBIRQ(intr interrupt.Interrupt) {
 		otg.GINTSTS.Set(otgGINTSTS_USBSUSP | otgGINTSTS_WKUINT | otgGINTSTS_RESETDET)
 	}
 
-	// IISOIXFR (incomplete iso IN xfer) — fires when the core failed to
-	// transmit on at least one iso IN endpoint at a microframe boundary.
-	// Clearing it isn't enough: the EP gets wedged in "still owed a
-	// transmit" state and subsequent microframes return EPROTO to the host.
-	// Recovery (mirroring stm32n6xx_hal_pcd.c IRQ handler): walk every iso
-	// IN endpoint with EPENA set, force-disable it (EPDIS+SNAK). PollUVC
-	// will re-arm on the next pass when FIFO is ready.
+	// IISOIXFR (incomplete iso IN xfer) — fires once per 1 ms periodic
+	// frame if any iso IN EP's FIFO is non-empty at end-of-frame. With our
+	// arm-push-XFRC-refill loop running at HS µframe rate (~8 kHz), it's
+	// normal for IISOIXFR to fire every frame: even one µframe where the
+	// core read 0 bytes (FIFO not yet refilled) leaves the FIFO with
+	// leftover data → IISOIXFR.
+	//
+	// Aggressive recovery (EPDIS+EPDISD+flush+rearm on every IISOIXFR)
+	// truncates in-flight transmits, sending mostly 4-byte short packets.
+	// We only recover when several frames in a row produce no XFRC,
+	// i.e. the EP looks genuinely stuck rather than just mid-stream.
+	//
+	// Always W1C-clear so the IRQ doesn't re-pend.
 	if sts&otgGINTSTS_IISOIXFR != 0 {
+		uvcIISOIXFRSinceXFRC++
+		if uvcIISOIXFRSinceXFRC >= uvcIISOIXFRStuckThreshold {
+			handleIISOIXFR()
+			uvcIISOIXFRSinceXFRC = 0
+		}
 		otg.GINTSTS.Set(otgGINTSTS_IISOIXFR)
+	}
+}
+
+// uvcIISOIXFRSinceXFRC counts consecutive IISOIXFR events without a
+// successful EP1 XFRC in between. Reset to 0 in handleIEPInt on XFRC.
+// When it crosses uvcIISOIXFRStuckThreshold, we treat the EP as stuck
+// and run the EPDIS-flush-rearm sequence.
+var uvcIISOIXFRSinceXFRC uint32
+
+const uvcIISOIXFRStuckThreshold = 8 // 8 frames = 8 ms of no progress
+
+// handleIISOIXFR identifies the iso IN endpoint that failed to complete
+// its transfer in the current frame and starts the disable sequence per
+// RM0486 73.15.6. The affected EP satisfies:
+//
+//	EPTYP == iso (01) AND EPENA == 1 AND EONUM == FNSOF[0]
+//
+// Setting EPDIS+SNAK requests disable; the core will fire EPDISD when
+// disabled, at which point handleIEPInt re-arms the EP with fresh data.
+func handleIISOIXFR() {
+	fnsofLow := (otg.DSTS.Get() >> 8) & 1
+	for ep := uint32(1); ep < NumberOfUSBEndpoints; ep++ {
+		v := diepctlReg(ep).Get()
+		if (v>>otgEPCTL_EPTYP_Pos)&0x3 != 1 {
+			continue // not iso
+		}
+		if v&otgEPCTL_EPENA == 0 {
+			continue // not armed
+		}
+		eonum := (v >> 16) & 1
+		if eonum != fnsofLow {
+			continue // EP wasn't scheduled for the current frame
+		}
+		// Stuck — initiate disable.
+		diepctlReg(ep).SetBits(otgEPCTL_EPDIS | otgEPCTL_SNAK)
 	}
 }
 
@@ -716,10 +762,38 @@ func handleIEPInt() {
 			} else if usbTxHandler[ep] != nil {
 				usbTxHandler[ep]()
 			}
+			// Successful XFRC on any EP — reset the IISOIXFR-stuck
+			// counter so the recovery only triggers on genuine stalls.
+			uvcIISOIXFRSinceXFRC = 0
 		}
 
-		// Clear any leftover maskable flags.
-		intReg.Set(flags & (otgDIEPINT_EPDISD | otgDIEPINT_TOC | otgDIEPINT_ITTXFE | otgDIEPINT_INEPNE))
+		// EPDISD (endpoint disabled) — fires after our IISOIXFR handler
+		// asks the core to disable a stuck iso EP. Per RM0486 73.15.6,
+		// the application must now flush the EP's TX FIFO and either
+		// re-arm with a fresh transfer or leave it disabled. We re-arm
+		// immediately by invoking the registered tx handler.
+		if flags&otgDIEPINT_EPDISD != 0 {
+			intReg.Set(otgDIEPINT_EPDISD)
+			if ep != 0 {
+				ctl := diepctlReg(ep).Get()
+				if (ctl>>otgEPCTL_EPTYP_Pos)&0x3 == 1 {
+					// Iso EP — flush its TX FIFO so the next push starts
+					// from a clean slate, then ask the tx handler to
+					// queue a new packet.
+					txfnum := (ctl >> otgEPCTL_TXFNUM_Pos) & 0xF
+					otg.GRSTCTL.Set(otgGRSTCTL_TXFFLSH | (txfnum << otgGRSTCTL_TXFNUM_Pos))
+					for otg.GRSTCTL.Get()&otgGRSTCTL_TXFFLSH != 0 {
+					}
+					if usbTxHandler[ep] != nil {
+						usbTxHandler[ep]()
+					}
+				}
+			}
+		}
+
+		// Clear any leftover maskable flags (EPDISD already cleared above
+		// if it was set; double-clear is harmless on W1C bits).
+		intReg.Set(flags & (otgDIEPINT_TOC | otgDIEPINT_ITTXFE | otgDIEPINT_INEPNE))
 	}
 }
 
