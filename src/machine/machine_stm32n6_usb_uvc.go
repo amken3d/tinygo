@@ -516,21 +516,38 @@ func uvcSendPacket() {
 }
 
 // uvcPixel returns one byte of the YUY2 test pattern at the given byte
-// offset in the frame. YUY2 stores pairs of pixels as Y0 U Y1 V.
-// Horizontal gradient with per-frame shift — visually confirms streaming.
+// offset in the frame. YUY2 stores pairs of pixels as Y0 U Y1 V; U and
+// V are shared between Y0/Y1 (4:2:2 chroma sub-sampling).
+//
+// Pattern: SMPTE-style 75 % vertical color bars — 8 bars across the
+// 160 px width (20 px per bar): white, yellow, cyan, green, magenta,
+// red, blue, black. Lets you visually confirm Y, U and V wiring;
+// missing chroma shows up as monochrome bars.
 func uvcPixel(offset uint32) byte {
-	// Reconstruct (x, y) from byte offset. Frame stride = width * 2.
-	stride := uint32(uvcWidth * uvcBPP)
-	x := (offset % stride) / 2 // pixel x
-	compo := offset % 4        // 0=Y0 1=U 2=Y1 3=V
-	switch compo {
+	stride := uint32(uvcWidth * uvcBPP) // 320 bytes per row
+	x := (offset % stride) / 2          // pixel column 0..159
+	bar := x / 20                       // 0..7
+	if bar > 7 {
+		bar = 7
+	}
+	switch offset % 4 {
 	case 0, 2:
-		// Y channel — horizontal ramp, shifted by frame count.
-		return byte(x + uvcTickCount*4)
-	default:
-		return 128 // U/V at neutral (greyscale look)
+		return uvcBarY[bar]
+	case 1:
+		return uvcBarU[bar]
+	default: // case 3
+		return uvcBarV[bar]
 	}
 }
+
+// SMPTE 75 % YUY2 color bars (BT.601 coefficients, full-range).
+//
+//	idx: 0=White 1=Yellow 2=Cyan 3=Green 4=Magenta 5=Red 6=Blue 7=Black
+var (
+	uvcBarY = [8]byte{180, 162, 131, 112, 84, 65, 35, 16}
+	uvcBarU = [8]byte{128, 44, 156, 72, 184, 100, 212, 128}
+	uvcBarV = [8]byte{128, 142, 44, 58, 198, 212, 114, 128}
+)
 
 // ---------------------------------------------------------------------------
 // UVC class-request handling (VS interface).
