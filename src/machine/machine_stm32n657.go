@@ -32,3 +32,25 @@ func (uart *UART) setRegisters() {
 	uart.txEmptyFlag = stm32.USART_ISR_TXE
 	uart.errClearReg = &uart.Bus.ICR
 }
+
+// getFreqRange returns the I2C TIMINGR register value for the requested
+// SCL frequency. I2C kernel clock on N6 defaults to PCLK1 (200 MHz in our
+// clock plan — see machine_stm32n6.go). Values below were calculated to
+// hit ~100/400 kHz with PCLK1=200 MHz; tune via STM32CubeMX if you need
+// different timing margins.
+func (i2c *I2C) getFreqRange(br uint32) uint32 {
+	switch br {
+	case 100 * KHz:
+		// PRESC=4 (div 5, t_PRESC=25ns), SCLDEL=4, SDADEL=0,
+		// SCLH=0xC7 (high=200*25=5000ns), SCLL=0xC7 (low=5000ns)
+		// → 10 µs period = 100 kHz.
+		return 0x4040C7C7
+	case 400 * KHz:
+		// PRESC=1 (div 2, t_PRESC=10ns), SCLDEL=4, SDADEL=0,
+		// SCLH=0x40 (high=65*10=650ns), SCLL=0xB8 (low=185*10=1850ns)
+		// → 2.5 µs period = 400 kHz.
+		return 0x104040B8
+	default:
+		return 0
+	}
+}

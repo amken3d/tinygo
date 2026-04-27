@@ -40,6 +40,30 @@ var (
 	DefaultUART = UART1
 )
 
+// I2C2 is wired to the camera connector (CN7) on the NUCLEO-N657X0-Q.
+// SCL/SDA are PB10/PB11 with alt function 4 (matches ST's BSP
+// stm32n6xx_nucleo_bus.h). The IMX335 sensor lives at I2C address 0x34.
+//
+// I2C0_SCL_PIN/I2C0_SDA_PIN are the default-pin fallback the i2c_revb
+// driver uses when Configure() is called without explicit SCL/SDA;
+// alias them to the I2C2 pins so a bare config works.
+const (
+	I2C2_SCL_PIN = PB10
+	I2C2_SDA_PIN = PB11
+	I2C2_ALT_FN  = 4 // GPIO_AF4_I2C2
+
+	I2C0_SCL_PIN = I2C2_SCL_PIN
+	I2C0_SDA_PIN = I2C2_SDA_PIN
+)
+
+var (
+	I2C2  = &_I2C2
+	_I2C2 = I2C{
+		Bus:             stm32.I2C2,
+		AltFuncSelector: I2C2_ALT_FN,
+	}
+)
+
 func init() {
 	UART1.Interrupt = interrupt.New(stm32.IRQ_USART1, _UART1.handleInterrupt)
 }
