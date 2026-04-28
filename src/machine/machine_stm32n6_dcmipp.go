@@ -97,6 +97,16 @@ type dcmippDevice struct {
 
 	intr     interrupt.Interrupt
 	intrInit bool
+
+	// Pipe 1 triple-buffer state. Active when pipe1TripleEnabled is true;
+	// the frame-complete IRQ rotates P1PPM0AR1 through pipe1Bufs[0..2] so
+	// the slot the reader (UVC) is consuming is never the slot DCMIPP
+	// writes next. See StartPipe1TripleBuffer.
+	pipe1TripleEnabled bool
+	pipe1Bufs          [3]uintptr
+	pipe1WritingIdx    int8 // slot DCMIPP is currently writing
+	pipe1LastDoneIdx   int8 // most recently completed; -1 if none
+	pipe1ReaderIdx     int8 // slot claimed by reader; -1 if none
 }
 
 // Configure brings up the DCMIPP common section: clocks, reset pulse,
@@ -384,6 +394,38 @@ func (d *dcmippDevice) handleInterrupt(interrupt.Interrupt) {
 	// Pipe 1 — same flag layout in P1SR/P1FCR.
 	sr1 := d.bus.P1SR.Get()
 	d.bus.P1FCR.Set(sr1 & flagMask)
+	if sr1&stm32.DCMIPP_P0SR_FRAMEF != 0 && d.pipe1TripleEnabled {
+		d.pipe1RotateLocked()
+	}
+}
+
+// pipe1RotateLocked advances the triple-buffer rotation. Call exactly once
+// per Pipe 1 frame-complete event. Runs in IRQ context, so no further
+// locking is needed; callers from main thread that touch pipe1ReaderIdx /
+// pipe1WritingIdx must IRQ-disable around their writes.
+//
+// Algorithm: just-completed slot becomes lastDone. Next write target is
+// the unique slot that's neither completed nor reader. With 3 slots and
+// the invariant reader != writing this is always exactly one slot.
+func (d *dcmippDevice) pipe1RotateLocked() {
+	completed := d.pipe1WritingIdx
+	d.pipe1LastDoneIdx = completed
+
+	reader := d.pipe1ReaderIdx
+	var next int8 = -1
+	for i := int8(0); i < 3; i++ {
+		if i != completed && i != reader {
+			next = i
+			break
+		}
+	}
+	if next < 0 {
+		// Shouldn't happen — invariant violated. Fall back to "anything
+		// not completed" so we keep rotating instead of wedging.
+		next = (completed + 1) % 3
+	}
+	d.pipe1WritingIdx = next
+	d.bus.P1PPM0AR1.Set(uint32(d.pipe1Bufs[next]))
 }
 
 // ==========================================================================
@@ -651,9 +693,15 @@ func (d *dcmippDevice) StartPipe1(buf []byte, mode DCMIPPCaptureMode) {
 
 // StartPipe1DoubleBuffer arms continuous Pipe 1 capture in double-buffer
 // mode: DCMIPP ping-pongs between buf0 and buf1 each frame, with the
-// alternation reflected in P1SR.DBSEL. Use Pipe1ActiveBuffer to find
-// which buffer DCMIPP is currently writing — the OTHER one is safe to
-// read from.
+// alternation reflected in P1PPCR.DBM.
+//
+// CAUTION: a 2-buffer pattern is fundamentally insufficient when the
+// reader (UVC) frame period is longer than the DCMIPP frame period — the
+// reader's buffer gets overwritten mid-frame, producing a horizontal tear
+// drifting between frames. Use StartPipe1TripleBuffer instead unless the
+// reader is strictly faster than DCMIPP. The companion Pipe1LastBuffer is
+// also wrong: it reads P1SR.LSTFRM (a CSI-2 sensor frame-counter LSB), not
+// the DBM toggle, so it cannot reliably tell which buffer is safe.
 //
 // Both buffers must be the same size (OutputWidth × OutputHeight × bpp)
 // and AXI-reachable.
@@ -678,17 +726,102 @@ func (d *dcmippDevice) StartPipe1DoubleBuffer(buf0, buf1 []byte) {
 	d.bus.P1FCTCR.SetBits(stm32.DCMIPP_P1FCTCR_CPTREQ)
 }
 
-// Pipe1LastBuffer returns 0 or 1 depending on which buffer DCMIPP just
-// finished writing (in double-buffer mode). That buffer is safe to read
-// — DCMIPP is now writing to the OTHER one. Reads P1SR.LSTFRM.
+// Pipe1LastBuffer is BROKEN — kept only so existing callers compile. It
+// reads P1SR.LSTFRM, which the RM defines as "Last frame LSB bit, sampled
+// at frame capture complete event. Information is extracted from the frame
+// data number that can be delivered by the camera through the CSI-2
+// interface" — i.e. the LSB of a sensor-supplied frame counter, not the
+// DBM ping-pong indicator. Whether it returns the right buffer depends on
+// whether the sensor numbers frames sequentially AND whether that parity
+// happens to align with DBM's toggle. There is no DBM "active buffer"
+// status register on the N6 DCMIPP; track it in software via the IRQ.
 //
-// Caller should latch this once per UVC frame (at frame-offset 0) and
-// hold the choice for the entire UVC frame to avoid mid-stream tearing.
+// Use Pipe1AcquireReader (paired with StartPipe1TripleBuffer) instead.
 func (d *dcmippDevice) Pipe1LastBuffer() int {
 	if d.bus.P1SR.HasBits(stm32.DCMIPP_P1SR_LSTFRM) {
 		return 1
 	}
 	return 0
+}
+
+// StartPipe1TripleBuffer arms continuous Pipe 1 capture rotating through
+// three buffers, with the IRQ-driven invariant that DCMIPP's next write
+// target is never the slot the reader is currently consuming. This
+// eliminates the tear-line that 2-buffer ping-pong can't avoid when the
+// reader frame period exceeds the DCMIPP frame period.
+//
+// All three buffers must be the same size (OutputWidth × OutputHeight ×
+// bpp), 16-byte aligned, and AXI-reachable. DCMIPP runs in single-buffer
+// mode (DBM=0); P1PPM0AR1 is reprogrammed by the frame-complete IRQ.
+//
+// Pairing: the reader (UVC) calls Pipe1AcquireReader at the start of each
+// of its frames to claim the most-recently-completed slot. The DCMIPP IRQ
+// reads pipe1ReaderIdx and avoids it when picking the next write target.
+//
+// State machine:
+//   - 3 slots: writing, lastDone, free.
+//   - On frame-end IRQ: lastDone ← writing; writing ← free; free ← old
+//     lastDone (unless the reader has claimed it).
+//   - On Pipe1AcquireReader: reader ← lastDone (atomic with IRQ disabled
+//     so the IRQ never sees an inconsistent (writing, reader) pair).
+func (d *dcmippDevice) StartPipe1TripleBuffer(buf0, buf1, buf2 []byte) {
+	if len(buf0) < 4 || len(buf1) < 4 || len(buf2) < 4 {
+		return
+	}
+
+	// Disarm before reconfiguring so partial register writes don't get
+	// latched into an in-flight capture.
+	d.bus.P1FCTCR.Set(0)
+	d.bus.P1FSCR.ClearBits(stm32.DCMIPP_P1FSCR_PIPEN)
+	d.bus.P1PPCR.ClearBits(stm32.DCMIPP_P1PPCR_DBM) // single-buffer mode
+
+	// Initialise software-tracked rotation state. Initial writing slot
+	// is 0; lastDone is -1 (no completed frame yet, so Pipe1AcquireReader
+	// will return nil until the first IRQ fires).
+	d.pipe1Bufs[0] = uintptr(unsafe.Pointer(&buf0[0]))
+	d.pipe1Bufs[1] = uintptr(unsafe.Pointer(&buf1[0]))
+	d.pipe1Bufs[2] = uintptr(unsafe.Pointer(&buf2[0]))
+	d.pipe1WritingIdx = 0
+	d.pipe1LastDoneIdx = -1
+	d.pipe1ReaderIdx = -1
+	d.pipe1TripleEnabled = true
+
+	// Point the AXI master at slot 0 for the first frame.
+	d.bus.P1PPM0AR1.Set(uint32(d.pipe1Bufs[0]))
+
+	// Continuous mode + CPTREQ. PIPEN last (matches HAL_DCMIPP_PIPE_Start).
+	d.bus.P1FSCR.SetBits(stm32.DCMIPP_P1FSCR_PIPEN)
+	d.bus.P1FCTCR.SetBits(stm32.DCMIPP_P1FCTCR_CPTREQ)
+}
+
+// Pipe1AcquireReader atomically claims the most-recently-completed Pipe 1
+// buffer for the reader. Returns the buffer's start address, or 0 if no
+// frame has completed yet (caller should fall back to a previous buffer
+// or skip the read for one frame).
+//
+// The DCMIPP IRQ guarantees not to pick the claimed slot as a write
+// target until Pipe1AcquireReader is called again with a different slot
+// available. Call this once per reader-frame; do not hold the claim
+// longer than one reader-frame or DCMIPP may stall (no free slot to
+// rotate into).
+//
+// Critical section is short — IRQ-disabled long enough to read lastDone
+// and write reader, ~10 cycles.
+func (d *dcmippDevice) Pipe1AcquireReader() uintptr {
+	if !d.pipe1TripleEnabled {
+		return 0
+	}
+	mask := interrupt.Disable()
+	last := d.pipe1LastDoneIdx
+	if last >= 0 {
+		d.pipe1ReaderIdx = last
+	}
+	idx := d.pipe1ReaderIdx
+	interrupt.Restore(mask)
+	if idx < 0 {
+		return 0
+	}
+	return d.pipe1Bufs[idx]
 }
 
 // StopPipe1 clears CPTREQ. In continuous mode the in-flight frame finishes

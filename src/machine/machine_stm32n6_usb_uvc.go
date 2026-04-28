@@ -25,6 +25,7 @@ package machine
 import (
 	"machine/usb"
 	"runtime/interrupt"
+	"unsafe"
 )
 
 // ---------------------------------------------------------------------------
@@ -604,21 +605,66 @@ var (
 	uvcMonoSource1      *[uvcMonoFrameBytes]byte
 	uvcMonoActiveSource *[uvcMonoFrameBytes]byte
 	uvcMonoLatchPick    func() int
+
+	// Triple-buffer variant — uvcMonoTriplePtr is set when triple-buffer
+	// mode is active. uvcPixel calls DCMIPP.Pipe1AcquireReader at offset
+	// 0 of each UVC frame to refresh the active source, eliminating the
+	// tear inherent to 2-buffer ping-pong when UVC frame period > DCMIPP
+	// frame period.
+	uvcMonoTriple bool
 )
 
 // SetUVCRawSourceMonoDouble wires two MonoY8 buffers and a "which buffer
 // just completed" callback. uvcPixel calls pickFn at the start of every
-// UVC frame to latch the safe-to-read buffer for that frame. Typical
-// pickFn implementation reads `DCMIPP.Pipe1LastBuffer()`.
+// UVC frame to latch the safe-to-read buffer for that frame.
+//
+// CAUTION: this is the legacy 2-buffer path and CANNOT eliminate tearing
+// when the UVC frame period exceeds the DCMIPP frame period (e.g. UVC
+// 26 fps vs DCMIPP 30 fps). The reader's buffer gets overwritten part-way
+// through. Use SetUVCRawSourceMonoTriple instead, which works with the
+// matching DCMIPP.StartPipe1TripleBuffer to keep the reader's slot off the
+// DCMIPP write rotation.
 func SetUVCRawSourceMonoDouble(buf0, buf1 *[uvcMonoFrameBytes]byte, pickFn func() int) {
 	uvcMonoSource = buf0
 	uvcMonoSource1 = buf1
 	uvcMonoLatchPick = pickFn
 	uvcMonoActiveSource = buf0
+	uvcMonoTriple = false
 	if buf0 != nil {
 		uvcRawSource = nil
 	}
 }
+
+// SetUVCRawSourceMonoTriple wires three MonoY8 buffers fed by
+// DCMIPP.StartPipe1TripleBuffer. uvcPixel calls
+// DCMIPP.Pipe1AcquireReader() at offset 0 of every UVC frame to claim the
+// most-recently-completed buffer; the DCMIPP frame-complete IRQ refuses to
+// pick that slot as the next write target, so the buffer is stable for the
+// full UVC frame.
+//
+// The three buf pointers are only used to fall back to a previous frame
+// if AcquireReader returns 0 before the first DCMIPP frame completes —
+// once streaming is up, the active source is selected by the DCMIPP
+// driver via Pipe1AcquireReader. Pass the same buf0/buf1/buf2 you passed
+// to StartPipe1TripleBuffer.
+//
+// All three buffers must be exactly UVCMonoFrameBytes long and AXI-
+// reachable.
+func SetUVCRawSourceMonoTriple(buf0, buf1, buf2 *[uvcMonoFrameBytes]byte) {
+	uvcMonoSource = buf0
+	uvcMonoSource1 = buf1
+	uvcMonoSource2 = buf2
+	uvcMonoLatchPick = nil
+	uvcMonoActiveSource = buf0
+	uvcMonoTriple = true
+	if buf0 != nil {
+		uvcRawSource = nil
+	}
+}
+
+// uvcMonoSource2 is the third buffer for triple-buffered mono mode. Only
+// non-nil when uvcMonoTriple is true.
+var uvcMonoSource2 *[uvcMonoFrameBytes]byte
 
 // UVCFrameBytes is the size in bytes of one YUY2 frame at the configured
 // UVC resolution. Use it when allocating a buffer to hand to
@@ -635,21 +681,41 @@ const uvcMonoFrameBytes = uvcWidth * uvcHeight
 // uvcPixel returns one byte of the YUY2 frame at the given byte offset.
 // Three sources, in priority order:
 //  1. uvcMonoSource: expand Y8 source bytes into YUYV macropixels.
-//     If a double-buffer pick callback was registered, latches the safe
-//     buffer once per UVC frame (at offset 0).
+//     In triple-buffer mode, claims the safe buffer from the DCMIPP
+//     driver at offset 0 of every UVC frame.
+//     In double-buffer mode (legacy), latches via uvcMonoLatchPick.
 //  2. uvcRawSource: pass through (source is already YUYV).
 //  3. SMPTE 75 % color bars (default fallback).
 func uvcPixel(offset uint32) byte {
 	if uvcMonoSource != nil {
-		// Latch the active buffer at the start of each UVC frame. This
-		// keeps a single UVC frame coming from one DCMIPP frame even
-		// when the UVC frame period is longer than the DCMIPP frame
-		// period (e.g. 38 ms UVC at 26 fps vs 33 ms DCMIPP at 30 fps).
-		if offset == 0 && uvcMonoLatchPick != nil && uvcMonoSource1 != nil {
-			if uvcMonoLatchPick() == 0 {
-				uvcMonoActiveSource = uvcMonoSource
-			} else {
-				uvcMonoActiveSource = uvcMonoSource1
+		// At UVC frame start, refresh the active source so the rest of
+		// the UVC frame reads from one stable DCMIPP frame.
+		if offset == 0 {
+			if uvcMonoTriple {
+				// Triple-buffer: ask DCMIPP for the most-recent-completed
+				// slot. DCMIPP's frame-end IRQ won't pick that slot as a
+				// write target until we make a different claim, so the
+				// buffer is stable for the entire UVC frame. Returns 0
+				// before the first DCMIPP frame has completed — fall back
+				// to the previously-active source in that case.
+				if addr := DCMIPP.Pipe1AcquireReader(); addr != 0 {
+					switch addr {
+					case uintptr(unsafe.Pointer(uvcMonoSource)):
+						uvcMonoActiveSource = uvcMonoSource
+					case uintptr(unsafe.Pointer(uvcMonoSource1)):
+						uvcMonoActiveSource = uvcMonoSource1
+					case uintptr(unsafe.Pointer(uvcMonoSource2)):
+						uvcMonoActiveSource = uvcMonoSource2
+					}
+				}
+			} else if uvcMonoLatchPick != nil && uvcMonoSource1 != nil {
+				// Legacy double-buffer path. Subject to tearing — see
+				// SetUVCRawSourceMonoDouble docstring.
+				if uvcMonoLatchPick() == 0 {
+					uvcMonoActiveSource = uvcMonoSource
+				} else {
+					uvcMonoActiveSource = uvcMonoSource1
+				}
 			}
 		}
 		if offset >= uvcFrameBytes {
