@@ -24,6 +24,7 @@ package machine
 
 import (
 	"machine/usb"
+	"runtime/interrupt"
 )
 
 // ---------------------------------------------------------------------------
@@ -72,14 +73,24 @@ const (
 	uvcVS_COMMIT_CONTROL = 0x02
 
 	// Fixed stream geometry
-	uvcWidth        = 160
-	uvcHeight       = 120
-	uvcBPP          = 2                             // YUY2 = 16 bpp
-	uvcFrameBytes   = uvcWidth * uvcHeight * uvcBPP // 38_400
-	uvcFrameIntvl   = 666_666                       // 15 fps, 100ns units
-	uvcIsoEP        = 1                             // EP1 IN
-	uvcIsoMPS       = 512                           // HS iso packet size
-	uvcPayloadBytes = uvcIsoMPS - 2                 // minus 2-byte UVC header
+	uvcWidth      = 320
+	uvcHeight     = 240
+	uvcBPP        = 2                             // YUY2 = 16 bpp
+	uvcFrameBytes = uvcWidth * uvcHeight * uvcBPP // 153_600
+	uvcFrameIntvl = 333_333                       // 30 fps, 100ns units (descriptor advertises this; we actually deliver ~26 fps which the host tolerates)
+	uvcIsoEP      = 1                             // EP1 IN
+	uvcIsoMPS     = 512                           // HS iso packet size. Tried 1024 (HS iso max) but
+	// the OTG TX FIFO appears to be sized for 512 → with MPS=1024 the
+	// EP stalled on every other packet, recovery rate jumped 20×.
+	// Stick with 512 until DIEPTXF for EP1 is resized.
+	//
+	// Payload size aligned to a 4-byte YUYV-macropixel boundary. (MPS-2)
+	// gives 510, which is `2 mod 4`. Iso has no retransmit, so a dropped
+	// packet on the wire would shift every subsequent byte in the frame
+	// by 2 — flipping Y/U positions and producing huge regions of 0x80
+	// (the chroma value) where Y values should be. Aligning to a 4-byte
+	// boundary preserves YUYV structure across drops.
+	uvcPayloadBytes = (uvcIsoMPS - 2) &^ 3 // 508
 
 	// VS interface number used in all descriptors + SET_INTERFACE hook.
 	uvcVCInterface = 0
@@ -238,22 +249,22 @@ var uvcConfigDesc = []byte{
 	30, uvcCS_INTERFACE, uvcVS_FRAME_UNCOMPRESSED,
 	1,    // bFrameIndex
 	0x00, // bmCapabilities
-	// wWidth / wHeight (160 × 120)
+	// wWidth / wHeight (320 × 240)
 	byte(uvcWidth & 0xFF), byte(uvcWidth >> 8),
 	byte(uvcHeight & 0xFF), byte(uvcHeight >> 8),
-	// dwMinBitRate = frame * fps * 8  (only one rate, so min == max)
-	// = 38400 * 15 * 8 = 4_608_000 = 0x0046_5000
-	0x00, 0x50, 0x46, 0x00,
+	// dwMinBitRate = frame_bytes * fps * 8  (only one rate, so min == max)
+	// = 153600 * 30 * 8 = 36_864_000 = 0x0230_0000
+	0x00, 0x00, 0x30, 0x02,
 	// dwMaxBitRate
-	0x00, 0x50, 0x46, 0x00,
-	// dwMaxVideoFrameBufferSize = uvcFrameBytes = 38_400 = 0x9600
-	0x00, 0x96, 0x00, 0x00,
-	// dwDefaultFrameInterval = 666666 = 0xA2C2A
-	0x2A, 0x2C, 0x0A, 0x00,
+	0x00, 0x00, 0x30, 0x02,
+	// dwMaxVideoFrameBufferSize = uvcFrameBytes = 153_600 = 0x00025800
+	0x00, 0x58, 0x02, 0x00,
+	// dwDefaultFrameInterval = 333333 (= 30 fps in 100-ns units) = 0x00051615
+	0x15, 0x16, 0x05, 0x00,
 	// bFrameIntervalType = 1 (one discrete interval)
 	1,
-	// dwFrameInterval[0] = 666666
-	0x2A, 0x2C, 0x0A, 0x00,
+	// dwFrameInterval[0] = 333333
+	0x15, 0x16, 0x05, 0x00,
 
 	// --- VS Color Matching ------------------------------------------- 6
 	6, uvcCS_INTERFACE, uvcVS_COLORFORMAT,
@@ -286,15 +297,15 @@ var uvcProbe = [34]byte{
 	0x00, 0x00, // bmHint
 	1, // bFormatIndex
 	1, // bFrameIndex
-	// dwFrameInterval = 666666
-	0x2A, 0x2C, 0x0A, 0x00,
+	// dwFrameInterval = 333333 (30 fps)
+	0x15, 0x16, 0x05, 0x00,
 	0x00, 0x00, // wKeyFrameRate
 	0x00, 0x00, // wPFrameRate
 	0x00, 0x00, // wCompQuality
 	0x00, 0x00, // wCompWindowSize
 	0x00, 0x00, // wDelay
-	// dwMaxVideoFrameSize = 38400 = 0x9600
-	0x00, 0x96, 0x00, 0x00,
+	// dwMaxVideoFrameSize = uvcFrameBytes = 153600 = 0x00025800
+	0x00, 0x58, 0x02, 0x00,
 	// dwMaxPayloadTransferSize = 512 (one iso packet)
 	0x00, 0x02, 0x00, 0x00,
 	// dwClockFrequency = 6 MHz
@@ -372,6 +383,9 @@ func UVCStats() {
 			" setCurOk=", uvcNSetCurOk, " setCurTimeo=", uvcNSetCurTimeo)
 		println("uvc: pumps polls=", uvcNPolls,
 			" sendsIn=", uvcNSendsEntered, " sendsOut=", uvcNSendsExited)
+		println("uvc: iisoixfr=", uvcNIISOIXFR,
+			" recov=", uvcNIISOIXFRRecoveries,
+			" sinceXFRC=", uvcIISOIXFRSinceXFRC)
 		println("uvc: last bReq=", uvcLastBReq, " cs=", uvcLastWValueH, " wLen=", uvcLastWLength)
 		println("uvc: streaming=", uvcStreaming, " frameOff=", uvcFrameOff, " tick=", uvcTickCount)
 	}
@@ -430,26 +444,36 @@ func uvcOnEP1XFRC() {
 	uvcSendPacket()
 }
 
-// PollUVC is now a no-op safety wrapper. The iso refill path is driven
-// by the XFRC IRQ via uvcOnEP1XFRC; calling this from the main loop
-// merely enters the streaming/EPENA gate and returns. Kept for backward
-// compatibility with mains that still call it.
+// PollUVC keeps the iso TX path alive when called from the main loop.
+// In steady state the XFRC IRQ refills automatically, but if the EP
+// stalls (loses parity, host pause, etc.) the IRQ may stop firing — the
+// poll re-arms it. Critical: the EPENA-check + uvcSendPacket call must
+// run with interrupts disabled. Without that, the XFRC IRQ can preempt
+// the main thread between the check and the send, producing two
+// uvcSendPacket invocations that race on uvcFrameOff/uvcFrameIndex/
+// uvcPacket — which manifests on the host as v4l2 "corrupted data
+// (N × 510 bytes)" errors with random N because frame offsets and FID
+// flips happen mid-frame.
 func PollUVC() {
 	if !uvcStreaming {
 		return
 	}
 	uvcNPolls++
+	mask := interrupt.Disable()
 	// If EP is already armed, IRQ path will refill on completion.
-	if diepctlReg(uvcIsoEP).Get()&otgEPCTL_EPENA != 0 {
-		return
+	if diepctlReg(uvcIsoEP).Get()&otgEPCTL_EPENA == 0 {
+		// EP not armed and streaming on — kick a packet (handles the
+		// very first send after SET_INTERFACE alt=1 too).
+		uvcSendPacket()
 	}
-	// EP not armed and streaming on — kick a packet (handles the very
-	// first send too, though uvcSetInterface already primes).
-	uvcSendPacket()
+	interrupt.Restore(mask)
 }
 
 // uvcSendPacket assembles one iso packet (2-byte UVC header + payload)
-// and pushes it to EP1's TX FIFO.
+// and pushes it to EP1's TX FIFO. The most recently built packet stays
+// in uvcPacket[] / uvcLastPacketLen so uvcResendLastPacket can re-push
+// it on iso-incomplete recovery without rebuilding (which would advance
+// uvcFrameOff and lose the data the host was about to receive).
 func uvcSendPacket() {
 	uvcNSendsEntered++
 
@@ -475,35 +499,8 @@ func uvcSendPacket() {
 	}
 
 	totalLen := uint32(n + 2)
-
-	// Per RM0486 73.15.6 "IN data transfers / Packet write":
-	//   1. Program DIEPTSIZ (transfer size + packet count + multi-count)
-	//   2. RMW DIEPCTL to set EPENA + CNAK + iso frame-parity hint
-	//      (preserving MPSIZ, EPTYP, TXFNUM, USBAEP from EP activation)
-	//   3. Write the complete packet's data to the TX FIFO
-	// Step 2 must happen BEFORE step 3 — that's the RM-prescribed order.
-	dieptsizReg(uvcIsoEP).Set(
-		(1 << otgDIEPTSIZ_PKTCNT_Pos) | // PKTCNT=1
-			(1 << 29) | // MCNT=01 (1 packet/µframe)
-			totalLen, // XFRSIZ
-	)
-
-	// Iso parity: program EONUM (bit 16, read-only) via SODDFRM (bit 29)
-	// or SEVNFRM (bit 28, named SD0PID in the SVD). Target the upcoming
-	// microframe's parity = opposite of current FNSOF[0] in DSTS bit 8.
-	even := otg.DSTS.Get()&(1<<8) == 0
-	var parityBit uint32
-	if even {
-		parityBit = otgEPCTL_SODDFRM // upcoming µf is odd
-	} else {
-		parityBit = otgEPCTL_SD0PID // = SEVNFRM, upcoming µf is even
-	}
-	diepctlReg(uvcIsoEP).SetBits(otgEPCTL_EPENA | otgEPCTL_CNAK | parityBit)
-
-	// Now push the complete packet's bytes into the TX FIFO. Per RM,
-	// the full payload must be present BEFORE the IN token arrives —
-	// otherwise the core sends a 0-byte iso IN.
-	fifoWrite(uvcIsoEP, uvcPacket[:totalLen])
+	uvcLastPacketLen = totalLen
+	uvcTransmitPacket(totalLen)
 
 	// Advance frame position; on frame boundary flip FID.
 	uvcFrameOff += uint32(n)
@@ -515,18 +512,171 @@ func uvcSendPacket() {
 	uvcNSendsExited++
 }
 
-// uvcPixel returns one byte of the YUY2 test pattern at the given byte
-// offset in the frame. YUY2 stores pairs of pixels as Y0 U Y1 V; U and
-// V are shared between Y0/Y1 (4:2:2 chroma sub-sampling).
+// uvcLastPacketLen is the length of the most recently built packet
+// (header + payload bytes already sitting in uvcPacket[]). Used by
+// uvcResendLastPacket so iso-incomplete recovery can re-push exactly
+// the same data without advancing uvcFrameOff.
+var uvcLastPacketLen uint32
+
+// uvcTransmitPacket programs DIEPTSIZ + DIEPCTL parity + EPENA and
+// pushes uvcPacket[:n] into the EP1 TX FIFO. Order matters: per RM,
+// FIFO data must be present BEFORE the IN token arrives, but DIEPCTL
+// arming must happen first so the core knows to drain.
+func uvcTransmitPacket(n uint32) {
+	dieptsizReg(uvcIsoEP).Set(
+		(1 << otgDIEPTSIZ_PKTCNT_Pos) | // PKTCNT=1
+			(1 << 29) | // MCNT=01 (1 packet/µframe)
+			n, // XFRSIZ
+	)
+
+	// Iso parity: program EONUM via SODDFRM (bit 29) or SD0PID/SEVNFRM
+	// (bit 28). Target the upcoming microframe = opposite of current
+	// FNSOF[0] in DSTS bit 8.
+	var parityBit uint32
+	if otg.DSTS.Get()&(1<<8) == 0 {
+		parityBit = otgEPCTL_SODDFRM // current even → upcoming odd
+	} else {
+		parityBit = otgEPCTL_SD0PID // current odd → upcoming even
+	}
+	diepctlReg(uvcIsoEP).SetBits(otgEPCTL_EPENA | otgEPCTL_CNAK | parityBit)
+
+	fifoWrite(uvcIsoEP, uvcPacket[:n])
+}
+
+// uvcResendLastPacket re-pushes the most recently built packet into
+// the FIFO and re-arms the EP. Used by the iso-incomplete recovery
+// path (EPDISD → flush → resend) so the packet that the OTG core was
+// trying to transmit when it got stuck eventually reaches the host
+// instead of being dropped. Mirrors ST's UVCL handler:
 //
-// Pattern: SMPTE-style 75 % vertical color bars — 8 bars across the
-// 160 px width (20 px per bar): white, yellow, cyan, green, magenta,
-// red, blue, black. Lets you visually confirm Y, U and V wiring;
-// missing chroma shows up as monochrome bars.
+//	USBD_LL_Transmit(p_dev, 0x81, p_ctx->packet, prev_len);
+func uvcResendLastPacket() {
+	if uvcLastPacketLen == 0 {
+		return
+	}
+	uvcTransmitPacket(uvcLastPacketLen)
+}
+
+// uvcRawSource is a YUYV-formatted source buffer (2 bytes per pixel,
+// pre-packed Y0/U/Y1/V). When set, uvcPixel passes its bytes straight
+// through to the iso EP. Use SetUVCRawSource to wire one in.
+var uvcRawSource *[uvcFrameBytes]byte
+
+// uvcMonoSource is a MonoY8 source buffer (1 byte per pixel, grayscale).
+// When set, uvcPixel synthesises YUYV on the fly: Y from the source byte,
+// U=V=0x80 (neutral chroma). Use SetUVCRawSourceMono to wire one in.
+//
+// Useful for streaming straight from a DCMIPP Pipe 1 configured with
+// PixelPackerFormat=MonoY8, while the YUV converter (P1YUVCR) is still
+// pending coefficient setup.
+var uvcMonoSource *[uvcMonoFrameBytes]byte
+
+// SetUVCRawSource wires a YUYV (16 bpp) sensor buffer into the UVC stream.
+// The buffer must be exactly UVCFrameBytes long and AXI-reachable. Pass
+// nil to revert to SMPTE color bars. Mutually exclusive with the mono
+// source (whichever was set most recently wins).
+func SetUVCRawSource(buf *[uvcFrameBytes]byte) {
+	uvcRawSource = buf
+	if buf != nil {
+		uvcMonoSource = nil
+	}
+}
+
+// SetUVCRawSourceMono wires a MonoY8 (8 bpp grayscale) sensor buffer into
+// the UVC stream. The buffer must be exactly UVCMonoFrameBytes long and
+// AXI-reachable. uvcPixel expands each source byte into one YUYV pair on
+// the fly (Y=byte, chroma=0x80). Pass nil to revert.
+func SetUVCRawSourceMono(buf *[uvcMonoFrameBytes]byte) {
+	uvcMonoSource = buf
+	uvcMonoSource1 = nil
+	uvcMonoActiveSource = buf
+	if buf != nil {
+		uvcRawSource = nil
+	}
+}
+
+// uvcMonoSource1 is the second buffer for double-buffered mono mode.
+// uvcMonoSourceSelect (set by uvcPixel at frame-offset 0) chooses which
+// of uvcMonoSource (= 0) or uvcMonoSource1 (= 1) is read for the rest
+// of the UVC frame. The selection is latched once per UVC frame so a
+// frame is never reassembled from two DCMIPP frames mid-stream.
+var (
+	uvcMonoSource1      *[uvcMonoFrameBytes]byte
+	uvcMonoActiveSource *[uvcMonoFrameBytes]byte
+	uvcMonoLatchPick    func() int
+)
+
+// SetUVCRawSourceMonoDouble wires two MonoY8 buffers and a "which buffer
+// just completed" callback. uvcPixel calls pickFn at the start of every
+// UVC frame to latch the safe-to-read buffer for that frame. Typical
+// pickFn implementation reads `DCMIPP.Pipe1LastBuffer()`.
+func SetUVCRawSourceMonoDouble(buf0, buf1 *[uvcMonoFrameBytes]byte, pickFn func() int) {
+	uvcMonoSource = buf0
+	uvcMonoSource1 = buf1
+	uvcMonoLatchPick = pickFn
+	uvcMonoActiveSource = buf0
+	if buf0 != nil {
+		uvcRawSource = nil
+	}
+}
+
+// UVCFrameBytes is the size in bytes of one YUY2 frame at the configured
+// UVC resolution. Use it when allocating a buffer to hand to
+// SetUVCRawSource.
+const UVCFrameBytes = uvcFrameBytes
+
+// UVCMonoFrameBytes is the size in bytes of one MonoY8 frame (one byte
+// per pixel) at the configured UVC resolution. Use it when allocating a
+// buffer to hand to SetUVCRawSourceMono.
+const UVCMonoFrameBytes = uvcMonoFrameBytes
+
+const uvcMonoFrameBytes = uvcWidth * uvcHeight
+
+// uvcPixel returns one byte of the YUY2 frame at the given byte offset.
+// Three sources, in priority order:
+//  1. uvcMonoSource: expand Y8 source bytes into YUYV macropixels.
+//     If a double-buffer pick callback was registered, latches the safe
+//     buffer once per UVC frame (at offset 0).
+//  2. uvcRawSource: pass through (source is already YUYV).
+//  3. SMPTE 75 % color bars (default fallback).
 func uvcPixel(offset uint32) byte {
-	stride := uint32(uvcWidth * uvcBPP) // 320 bytes per row
-	x := (offset % stride) / 2          // pixel column 0..159
-	bar := x / 20                       // 0..7
+	if uvcMonoSource != nil {
+		// Latch the active buffer at the start of each UVC frame. This
+		// keeps a single UVC frame coming from one DCMIPP frame even
+		// when the UVC frame period is longer than the DCMIPP frame
+		// period (e.g. 38 ms UVC at 26 fps vs 33 ms DCMIPP at 30 fps).
+		if offset == 0 && uvcMonoLatchPick != nil && uvcMonoSource1 != nil {
+			if uvcMonoLatchPick() == 0 {
+				uvcMonoActiveSource = uvcMonoSource
+			} else {
+				uvcMonoActiveSource = uvcMonoSource1
+			}
+		}
+		if offset >= uvcFrameBytes {
+			return 0
+		}
+		switch offset & 3 {
+		case 0, 2:
+			pix := offset / 2 // source pixel index for this Y slot
+			if pix < uvcMonoFrameBytes && uvcMonoActiveSource != nil {
+				return uvcMonoActiveSource[pix]
+			}
+			return 0
+		default: // 1 or 3 — U or V slot
+			return 0x80
+		}
+	}
+	if uvcRawSource != nil {
+		if offset < uvcFrameBytes {
+			return uvcRawSource[offset]
+		}
+		return 0
+	}
+
+	// Fallback: SMPTE 75 % color bars.
+	stride := uint32(uvcWidth * uvcBPP) // bytes per row
+	x := (offset % stride) / 2          // pixel column 0..uvcWidth-1
+	bar := x / (uvcWidth / 8)           // 0..7
 	if bar > 7 {
 		bar = 7
 	}

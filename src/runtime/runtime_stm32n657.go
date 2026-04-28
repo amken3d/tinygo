@@ -9,12 +9,6 @@ import (
 func init() {
 	initCLK()
 
-	// Note: machine.InitExtendedAXISRAM() is called lazily from the
-	// DCMIPP driver path now, after InitSerial — earlier calls were
-	// hanging the board before any output was visible. Investigation
-	// pending; the in-machine RISAF setup pattern from DCMIPP.Configure
-	// is known good.
-
 	machine.InitSerial()
 
 	// N6's initTickTimer uses SysTick (see runtime_stm32n6_timers.go), not

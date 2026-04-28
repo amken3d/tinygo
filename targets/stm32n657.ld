@@ -16,17 +16,8 @@
 
 MEMORY
 {
-    FLASH_TEXT (rx)  : ORIGIN = 0x34180400, LENGTH = 255K
-    RAM        (xrw) : ORIGIN = 0x341C0000, LENGTH = 256K
-
-    /* Extended AXI SRAMs. Each is gated by RCC.MEMENR.AXISRAMxEN and
-     * protected by its own RISAF instance (RISAF4..7 for SRAM3..6).
-     * runtime_stm32n6.go enables clocks and opens RISAF regions before
-     * any code touches these. Variables land here via `//go:section`. */
-    AXISRAM3   (xrw) : ORIGIN = 0x34200000, LENGTH = 448K
-    AXISRAM4   (xrw) : ORIGIN = 0x34270000, LENGTH = 448K
-    AXISRAM5   (xrw) : ORIGIN = 0x342E0000, LENGTH = 448K
-    AXISRAM6   (xrw) : ORIGIN = 0x34350000, LENGTH = 448K
+    FLASH_TEXT (rx) : ORIGIN = 0x34180400, LENGTH = 255K
+    RAM (xrw)       : ORIGIN = 0x341C0000, LENGTH = 256K
 }
 
 _stack_size = 8K;
@@ -46,24 +37,3 @@ PROVIDE(_mem_pool_AXISRAM6_network   = 0x34350000);
 PROVIDE(_mem_pool_xSPI2_network      = 0x70380000);
 
 INCLUDE "targets/arm.ld"
-
-/* Place `//go:section ".axisramN"` variables into the matching extended
- * AXISRAM block. NOLOAD keeps the bootloader from zero-filling them at
- * boot — large buffers are caller-managed (the camera pipe will overwrite
- * the entire buffer before it's read anyway).
- */
-SECTIONS
-{
-    .axisram3 (NOLOAD) : ALIGN(16) {
-        KEEP(*(.axisram3))
-    } > AXISRAM3
-    .axisram4 (NOLOAD) : ALIGN(16) {
-        KEEP(*(.axisram4))
-    } > AXISRAM4
-    .axisram5 (NOLOAD) : ALIGN(16) {
-        KEEP(*(.axisram5))
-    } > AXISRAM5
-    .axisram6 (NOLOAD) : ALIGN(16) {
-        KEEP(*(.axisram6))
-    } > AXISRAM6
-}

@@ -127,37 +127,12 @@ func (d *dcmippDevice) Configure(cfg DCMIPPConfig) {
 	stm32.RIFSC.RISC_SECCFGR2.SetBits(1 << 29)
 	stm32.RIFSC.RISC_PRIVCFGR2.SetBits(1 << 29)
 
-	// 0b. RISAF3 region for AXISRAM2: granting RIMC permission to DCMIPP
-	//     isn't enough — AXISRAM2 itself has its own per-region access
-	//     control (RISAF3). By default no region is enabled and the deny
-	//     policy blocks all bus-master accesses (only the CPU works
-	//     because the FSBL set up an MPU/CACHE path that bypasses RISAF
-	//     for CPU loads/stores). RISAF3 lives at 0x44028000 — same
-	//     register layout as the SVD-defined RISAF1, just at a different
-	//     address. We open REG1 to cover the entire AXISRAM2 (0x34100000
-	//     .. 0x341FFFFF) and grant CID 0 (CPU) + CID 1 (DCMIPP/etc.) full
-	//     read+write access.
-	risaf3 := (*stm32.RISAF_Type)(unsafe.Pointer(uintptr(0x44028000)))
-	// STARTR/ENDR are offsets within AXISRAM2 (the high bits are
-	// hard-wired to the region's base address), so 0..0xFFFFF covers
-	// the full AXISRAM2.
-	risaf3.REG1_STARTR.Set(0x00000000)
-	risaf3.REG1_ENDR.Set(0x000FFFFF)
-	// Allow read+write for CID 0 (CPU) and CID 1 (DCMIPP, plus other
-	// AXI masters that ST configures with CID=1). Setting CIDs 2..7
-	// triggered a bus fault in testing — those slots may be reserved
-	// or aliased by RIF.
-	risaf3.REG1_CIDCFGR.Set(
-		(1 << 0) | (1 << 1) | // RDENC0 | RDENC1
-			(1 << 16) | (1 << 17), // WRENC0 | WRENC1
-	)
-	// CFGR: BREN=1 + SEC=1. With TZEN off the M55 sends transactions
-	// tagged secure (single-state == secure-equivalent), and DCMIPP
-	// inherits secure from RISC_SECCFGR2. SEC=0 would deny CPU access
-	// (proven empirically: hung at next stack reference).
-	risaf3.REG1_CFGR.Set((1 << 0) | (1 << 8))
-	// Clear any pending illegal-access flag from prior boots.
-	risaf3.IACR.Set(stm32.RISAF_IASR_CAEF | stm32.RISAF_IASR_IAEF)
+	// 0b. No RISAF programming. ST's DCMIPP_ContinuousMode reference
+	//     never touches RISAF — RIMC + RISC alone are sufficient when the
+	//     destination buffer lives in AXISRAM3 (the region ST uses), since
+	//     RISAF4 (AXISRAM3) is permissive enough by default. Caller is
+	//     expected to use AXISRAM3 (0x34200000+) and to have called
+	//     InitExtendedAXISRAM beforehand.
 
 	// 0. Kernel clock: route IC17 = PLL3 / 2 = 450 MHz to the DCMIPP.
 	//    Higher than ST's PLL2/3=333 MHz, but PLL3 is what we have
@@ -447,9 +422,14 @@ const (
 type Pipe1Format uint8
 
 const (
-	Pipe1FormatYUYV   Pipe1Format = 6  // YUV422 1-buffer, byte order Y0 U Y1 V
-	Pipe1FormatUYVY   Pipe1Format = 10 // YUV422 1-buffer, byte order U Y0 V Y1
-	Pipe1FormatRGB565 Pipe1Format = 1
+	Pipe1FormatRGB888 Pipe1Format = 0  // 24 bpp R8 G8 B8 (or YUV444 if YUVConv enabled)
+	Pipe1FormatRGB565 Pipe1Format = 1  // 16 bpp R5 G6 B5
+	Pipe1FormatARGB   Pipe1Format = 2  // 32 bpp A=0xFF + R8 G8 B8
+	Pipe1FormatRGBA   Pipe1Format = 3  // 32 bpp R8 G8 B8 + A=0xFF
+	Pipe1FormatMonoY8 Pipe1Format = 4  // 8 bpp grayscale (G8 from demosaic, or Y if YUVConv)
+	Pipe1FormatYUV444 Pipe1Format = 5  // 32 bpp YUV444 1-buffer
+	Pipe1FormatYUYV   Pipe1Format = 6  // 16 bpp YUV422 1-buffer, Y0 U Y1 V byte order
+	Pipe1FormatUYVY   Pipe1Format = 10 // 16 bpp YUV422 1-buffer, U Y0 V Y1 byte order
 )
 
 // Pipe1Config configures the Pipe 1 ISP path end-to-end.
@@ -466,10 +446,29 @@ type Pipe1Config struct {
 	// InputWidth, InputHeight describe the sensor's frame size.
 	InputWidth, InputHeight uint16
 
-	// OutputWidth, OutputHeight are the final post-crop dimensions.
-	// The downsizer takes input → max ratio (8× per axis), then a crop
-	// trims to OutputWidth × OutputHeight.
+	// OutputWidth, OutputHeight are the post-downsize dimensions written
+	// to memory.
+	//
+	// The DCMIPP downsize block has a hard 16-bit field for HRATIO/VRATIO
+	// where ratio = 8192 × source / dest. The field saturates at 65535
+	// (≈ 8.0×), and *programming the field at exactly 65535 makes the
+	// downsize block degenerate to ~1/64 of the requested output*. The
+	// caller must ensure source/dest is strictly below 8.0× per axis —
+	// either by choosing a larger output, or by setting SourceCrop* to
+	// trim the sensor frame to dimensions that scale cleanly.
 	OutputWidth, OutputHeight uint16
+
+	// SourceCropX, SourceCropY, SourceCropW, SourceCropH define a crop
+	// applied *before* downsize. Zero W or H means "no crop" — the
+	// full InputWidth × InputHeight is passed through.
+	//
+	// Use this when output dimensions would otherwise hit the downsize
+	// clamp. Example: IMX335 2592×1944 → 320×240 needs ratio 8.1× which
+	// clamps. Setting SourceCrop to (96, 72, 2400, 1800) feeds the
+	// downsize a 2400×1800 sub-rectangle and produces clean 320×240
+	// output (ratio 7.5×, no clamp).
+	SourceCropX, SourceCropY uint16
+	SourceCropW, SourceCropH uint16
 
 	// BayerType matches the sensor's Bayer pattern.
 	BayerType Pipe1BayerType
@@ -482,22 +481,12 @@ type Pipe1Config struct {
 // The pipe is left enabled (PIPEN=1) and ready to receive a StartPipe1
 // arm. Call after Configure() (which sets up the common section + clocks).
 func (d *dcmippDevice) ConfigurePipe1(cfg Pipe1Config) {
-	// IP-Plug: lock, write Client 2 traffic shaping (OTR=8 to allow
-	// pipelined AXI bursts) and the global memory page size, then
-	// release PSTART. Smaller page size (64B vs default 256B) is more
-	// forgiving of buffers that aren't page-aligned, which ours isn't.
-	d.bus.IPGR2.SetBits(stm32.DCMIPP_IPGR2_PSTART)
-	for i := 0; i < 100_000; i++ {
-		if d.bus.IPGR3.HasBits(stm32.DCMIPP_IPGR3_IDLE) {
-			break
-		}
-	}
-	d.bus.IPGR1.Set(0) // 64-byte memory page
-	d.bus.IPC2R1.Set(
-		(4 << stm32.DCMIPP_IPC2R1_TRAFFIC_Pos) | // 128-byte burst
-			(7 << stm32.DCMIPP_IPC2R1_OTR_Pos), // 8 outstanding
-	)
-	d.bus.IPGR2.ClearBits(stm32.DCMIPP_IPGR2_PSTART)
+	// IP-Plug left at reset defaults — matches ST's DCMIPP_ContinuousMode
+	// reference, which never calls HAL_DCMIPP_SetIPPlugConfig. Earlier we
+	// wrote IPGR1=0 (64B page) plus IPC2R1.TRAFFIC=4 (128B burst); burst >
+	// page is invalid on the IP-Plug AXI master and silently truncated
+	// most of the writes — Pipe 1 only filled the first ~1/64 of the
+	// destination buffer.
 
 	// Disarm and disable the pipe before reconfiguring.
 	d.bus.P1FCTCR.Set(0)
@@ -514,51 +503,84 @@ func (d *dcmippDevice) ConfigurePipe1(cfg Pipe1Config) {
 			(vc << stm32.DCMIPP_P1FSCR_VC_Pos),
 	)
 
-	// Black-level calibration: enable with zero offsets. The ISP requires
-	// BLC to be on (per ST's BSP) for the demosaic block to behave well
-	// even when the offsets are zero.
-	d.bus.P1BLCCR.Set(stm32.DCMIPP_P1BLCCR_ENABLE)
+	// Black-level calibration. IMX335 raw output has a black-level
+	// pedestal of ~12 LSB per channel; subtracting it gives true black
+	// at zero. Values match ST's IQTune-generated isp_param_conf.h
+	// (BLCR = BLCG = BLCB = 12).
+	const blcOffset = 12
+	d.bus.P1BLCCR.Set(
+		stm32.DCMIPP_P1BLCCR_ENABLE |
+			(blcOffset << stm32.DCMIPP_P1BLCCR_BLCR_Pos) |
+			(blcOffset << stm32.DCMIPP_P1BLCCR_BLCG_Pos) |
+			(blcOffset << stm32.DCMIPP_P1BLCCR_BLCB_Pos),
+	)
 
-	// Demosaic / Bayer→RGB. Mid-strength filter (STRENGTH_8 = 4) for all
-	// four detectors gives reasonable edges without heavy ringing.
-	const algStrength = 4
+	// Demosaic / Bayer→RGB. Per-detector strengths from ST's IQTune
+	// (peak=2, lineV=4, lineH=4, edge=6).
 	d.bus.P1DMCR.Set(
 		stm32.DCMIPP_P1DMCR_ENABLE |
 			(uint32(cfg.BayerType) << stm32.DCMIPP_P1DMCR_TYPE_Pos) |
-			(algStrength << stm32.DCMIPP_P1DMCR_PEAK_Pos) |
-			(algStrength << stm32.DCMIPP_P1DMCR_LINEV_Pos) |
-			(algStrength << stm32.DCMIPP_P1DMCR_LINEH_Pos) |
-			(algStrength << stm32.DCMIPP_P1DMCR_EDGE_Pos),
+			(2 << stm32.DCMIPP_P1DMCR_PEAK_Pos) |
+			(4 << stm32.DCMIPP_P1DMCR_LINEV_Pos) |
+			(4 << stm32.DCMIPP_P1DMCR_LINEH_Pos) |
+			(6 << stm32.DCMIPP_P1DMCR_EDGE_Pos),
 	)
 
-	// Decimation disabled (broke writes outright when on; dropped to
-	// 0 bytes touched). Re-enable later once we understand why.
-	d.bus.P1DECR.Set(0)
-	effInputW := uint32(cfg.InputWidth)
-	effInputH := uint32(cfg.InputHeight)
+	// Gamma correction. IQTune sets enable=1 for IMX335. Maps the
+	// linear sensor response into perceptually-flat luminance.
+	d.bus.P1GMCR.Set(stm32.DCMIPP_P1GMCR_ENABLE)
 
-	// Downsize from (decimated) input → output. With decimation 2× the
-	// effective input is 1296×972 for IMX335; downsize to 320×240 needs
-	// HRatio = 8192*1296/320 ≈ 33177 — well under the 65535 ceiling,
-	// so no crop step needed (downsize lands exactly on 320×240).
-	const ratioMax = 65535
-	hRatio := uint32(8192) * effInputW / uint32(cfg.OutputWidth)
-	if hRatio > ratioMax {
-		hRatio = ratioMax
+	// Decimation disabled. Decimation drops every Nth pixel/line which
+	// breaks the Bayer pattern that the demosaic block expects. Use
+	// SourceCrop instead when input pre-shrink is needed.
+	d.bus.P1DECR.Set(0)
+
+	// Source crop sits BEFORE the downsize block in the pipeline. When
+	// SourceCropW/H are non-zero we feed the downsize a sub-rectangle of
+	// the sensor frame; otherwise the full input passes through.
+	cropW := uint32(cfg.SourceCropW)
+	cropH := uint32(cfg.SourceCropH)
+	cropX := uint32(cfg.SourceCropX)
+	cropY := uint32(cfg.SourceCropY)
+	useCrop := cropW != 0 && cropH != 0
+	if useCrop {
+		d.bus.P1CRSTR.Set(cropX | (cropY << stm32.DCMIPP_P1CRSTR_VSTART_Pos))
+		d.bus.P1CRSZR.Set(
+			cropW |
+				(cropH << stm32.DCMIPP_P1CRSZR_VSIZE_Pos) |
+				stm32.DCMIPP_P1CRSZR_ENABLE,
+		)
+	} else {
+		d.bus.P1CRSTR.Set(0)
+		d.bus.P1CRSZR.Set(0)
+		cropW = uint32(cfg.InputWidth)
+		cropH = uint32(cfg.InputHeight)
 	}
-	vRatio := uint32(8192) * effInputH / uint32(cfg.OutputHeight)
-	if vRatio > ratioMax {
-		vRatio = ratioMax
+
+	// Downsize ratio = 8192 × Source / Dest, capped at 65535 by the
+	// register's 16-bit field. Empirical fact: programming HRATIO or
+	// VRATIO at exactly 65535 (the field max, ≈ 8.0× downsize) makes
+	// the downsize block degenerate to producing only the top-left
+	// ~1/64 of the requested output. Stay strictly below the clamp.
+	//
+	// For ratios that would otherwise exceed 65535 the caller must
+	// pre-shrink with SourceCrop. We don't attempt any silent fix here —
+	// the wrong workaround produces a corrupt frame.
+	const ratioMax = 65520 // one below 65535 to be safe; never clamp
+	hRatio := uint32(8192) * cropW / uint32(cfg.OutputWidth)
+	vRatio := uint32(8192) * cropH / uint32(cfg.OutputHeight)
+	if hRatio > ratioMax || vRatio > ratioMax {
+		// Refuse to program a known-bad config. Leave the pipe disabled
+		// so the caller's StartPipe1 won't produce a corrupted frame.
+		d.bus.P1FSCR.ClearBits(stm32.DCMIPP_P1FSCR_PIPEN)
+		d.bus.P1DSCR.Set(0)
+		return
 	}
 	// Per ST's CMW_UTILS_get_down_config: HDivFactor = (1024*8192-1) / HRatio.
 	hDiv := uint32(1024*8192-1) / hRatio
 	vDiv := uint32(1024*8192-1) / vRatio
-	// Intermediate size — what the downsize would produce given input
-	// and ratio — used only to decide whether crop is needed.
-	interW := effInputW * 8192 / hRatio
-	interH := effInputH * 8192 / vRatio
 
-	// Order matters here: ST's HAL_DCMIPP_PIPE_SetDownsizeConfig writes
+	// Order matters: ST's HAL_DCMIPP_PIPE_SetDownsizeConfig writes
 	// HDIV/VDIV first (without ENABLE), then HRATIO/VRATIO, then HSIZE/
 	// VSIZE — and only afterwards SET-bits ENABLE. Doing it in one
 	// monolithic write with ENABLE included can latch the wrong internal
@@ -569,28 +591,21 @@ func (d *dcmippDevice) ConfigurePipe1(cfg Pipe1Config) {
 		uint32(cfg.OutputWidth) |
 			(uint32(cfg.OutputHeight) << stm32.DCMIPP_P1DSSZR_VSIZE_Pos),
 	)
-	// Now enable downsize as a separate write.
 	d.bus.P1DSCR.SetBits(stm32.DCMIPP_P1DSCR_ENABLE)
 
-	// Crop: only enable if the downsize couldn't reach OutputWidth/Height
-	// exactly (intermediate was bigger than target). Explicitly clear
-	// P1CRSTR so HSTART/VSTART = 0 (top-left origin).
-	d.bus.P1CRSTR.Set(0)
-	if interW > uint32(cfg.OutputWidth) || interH > uint32(cfg.OutputHeight) {
-		d.bus.P1CRSZR.Set(
-			uint32(cfg.OutputWidth) |
-				(uint32(cfg.OutputHeight) << stm32.DCMIPP_P1CRSZR_VSIZE_Pos) |
-				stm32.DCMIPP_P1CRSZR_ENABLE,
-		)
-	} else {
-		d.bus.P1CRSZR.Set(0)
-	}
-
 	// Pixel packer: pure FORMAT field; nothing else needed for YUV422
-	// 1-buffer. Pitch = OutputWidth × 2 bytes (each pixel is one byte
-	// of luma + half a byte of chroma, packed per YUYV).
+	// 1-buffer. Pitch = OutputWidth × bytes-per-pixel (depends on format).
 	d.bus.P1PPCR.Set(uint32(cfg.Format) << stm32.DCMIPP_P1PPCR_FORMAT_Pos)
-	d.bus.P1PPM0PR.Set(uint32(cfg.OutputWidth) * 2)
+	bpp := uint32(2) // default for YUYV/UYVY/RGB565
+	switch cfg.Format {
+	case Pipe1FormatMonoY8:
+		bpp = 1
+	case Pipe1FormatRGB888:
+		bpp = 3
+	case Pipe1FormatARGB, Pipe1FormatRGBA, Pipe1FormatYUV444:
+		bpp = 4
+	}
+	d.bus.P1PPM0PR.Set(uint32(cfg.OutputWidth) * bpp)
 
 	// IRQ sources for Pipe 1: FRAMEF (frame complete) and OVRF (overrun).
 	// Without OVRIE the shared DCMIPP IRQ handler never gets a chance to
@@ -612,8 +627,7 @@ func (d *dcmippDevice) ConfigurePipe1(cfg Pipe1Config) {
 // first, then enable PIPEN and CPTREQ together.
 //
 // buf must be at least OutputWidth × OutputHeight × 2 bytes (for YUYV) and
-// 16-byte aligned. The pipe writes via the same AXI master as Pipe 0, so
-// the same RIF / RISAF setup applies.
+// 16-byte aligned.
 func (d *dcmippDevice) StartPipe1(buf []byte, mode DCMIPPCaptureMode) {
 	if len(buf) < 4 {
 		return
@@ -623,17 +637,58 @@ func (d *dcmippDevice) StartPipe1(buf []byte, mode DCMIPPCaptureMode) {
 	// Disarm to avoid mid-flight half-config.
 	d.bus.P1FCTCR.Set(0)
 	d.bus.P1FSCR.ClearBits(stm32.DCMIPP_P1FSCR_PIPEN)
+	d.bus.P1PPCR.ClearBits(stm32.DCMIPP_P1PPCR_DBM) // single-buffer
 
-	// Set capture mode bit (CPTMODE for snapshot) and destination addr.
 	if mode == DCMIPPCaptureSnapshot {
 		d.bus.P1FCTCR.Set(stm32.DCMIPP_P1FCTCR_CPTMODE)
 	}
 	d.bus.P1PPM0AR1.Set(uint32(addr))
 
-	// Activate pipe + start capture (PIPEN and CPTREQ together, matching
-	// HAL_DCMIPP_PIPE_Start's DCMIPP_EnableCapture).
+	// Activate pipe + start capture (PIPEN and CPTREQ together).
 	d.bus.P1FSCR.SetBits(stm32.DCMIPP_P1FSCR_PIPEN)
 	d.bus.P1FCTCR.SetBits(stm32.DCMIPP_P1FCTCR_CPTREQ)
+}
+
+// StartPipe1DoubleBuffer arms continuous Pipe 1 capture in double-buffer
+// mode: DCMIPP ping-pongs between buf0 and buf1 each frame, with the
+// alternation reflected in P1SR.DBSEL. Use Pipe1ActiveBuffer to find
+// which buffer DCMIPP is currently writing — the OTHER one is safe to
+// read from.
+//
+// Both buffers must be the same size (OutputWidth × OutputHeight × bpp)
+// and AXI-reachable.
+func (d *dcmippDevice) StartPipe1DoubleBuffer(buf0, buf1 []byte) {
+	if len(buf0) < 4 || len(buf1) < 4 {
+		return
+	}
+	a0 := uintptr(unsafe.Pointer(&buf0[0]))
+	a1 := uintptr(unsafe.Pointer(&buf1[0]))
+
+	// Disarm.
+	d.bus.P1FCTCR.Set(0)
+	d.bus.P1FSCR.ClearBits(stm32.DCMIPP_P1FSCR_PIPEN)
+
+	// Program both addresses, enable DBM in P1PPCR.
+	d.bus.P1PPM0AR1.Set(uint32(a0))
+	d.bus.P1PPM0AR2.Set(uint32(a1))
+	d.bus.P1PPCR.SetBits(stm32.DCMIPP_P1PPCR_DBM)
+
+	// Continuous-mode arm: PIPEN + CPTREQ.
+	d.bus.P1FSCR.SetBits(stm32.DCMIPP_P1FSCR_PIPEN)
+	d.bus.P1FCTCR.SetBits(stm32.DCMIPP_P1FCTCR_CPTREQ)
+}
+
+// Pipe1LastBuffer returns 0 or 1 depending on which buffer DCMIPP just
+// finished writing (in double-buffer mode). That buffer is safe to read
+// — DCMIPP is now writing to the OTHER one. Reads P1SR.LSTFRM.
+//
+// Caller should latch this once per UVC frame (at frame-offset 0) and
+// hold the choice for the entire UVC frame to avoid mid-stream tearing.
+func (d *dcmippDevice) Pipe1LastBuffer() int {
+	if d.bus.P1SR.HasBits(stm32.DCMIPP_P1SR_LSTFRM) {
+		return 1
+	}
+	return 0
 }
 
 // StopPipe1 clears CPTREQ. In continuous mode the in-flight frame finishes
@@ -645,4 +700,50 @@ func (d *dcmippDevice) StopPipe1() {
 // Pipe1Active reports whether Pipe 1 currently has a capture in flight.
 func (d *dcmippDevice) Pipe1Active() bool {
 	return d.bus.P1SR.HasBits(stm32.DCMIPP_P1SR_CPTACT)
+}
+
+// Pipe1RegDump returns a snapshot of Pipe 1's key registers, for debug.
+func (d *dcmippDevice) Pipe1RegDump() Pipe1Regs {
+	return Pipe1Regs{
+		IPGR1:     stm32.DCMIPP.IPGR1.Get(),
+		IPC2R1:    stm32.DCMIPP.IPC2R1.Get(),
+		IPC2R3:    stm32.DCMIPP.IPC2R3.Get(),
+		CMCR:      d.bus.CMCR.Get(),
+		P1FSCR:    d.bus.P1FSCR.Get(),
+		P1FCTCR:   d.bus.P1FCTCR.Get(),
+		P1SR:      d.bus.P1SR.Get(),
+		P1FCR:     d.bus.P1FCR.Get(),
+		P1BLCCR:   d.bus.P1BLCCR.Get(),
+		P1DMCR:    d.bus.P1DMCR.Get(),
+		P1DECR:    d.bus.P1DECR.Get(),
+		P1DCCR:    d.bus.P1DCCR.Get(),
+		P1DSCR:    d.bus.P1DSCR.Get(),
+		P1DSRTIOR: d.bus.P1DSRTIOR.Get(),
+		P1DSSZR:   d.bus.P1DSSZR.Get(),
+		P1CRSTR:   d.bus.P1CRSTR.Get(),
+		P1CRSZR:   d.bus.P1CRSZR.Get(),
+		P1GMCR:    d.bus.P1GMCR.Get(),
+		P1YUVCR:   d.bus.P1YUVCR.Get(),
+		P1PPCR:    d.bus.P1PPCR.Get(),
+		P1PPM0PR:  d.bus.P1PPM0PR.Get(),
+		P1PPM0AR1: d.bus.P1PPM0AR1.Get(),
+	}
+}
+
+// Pipe1Regs is a snapshot of Pipe 1's key registers.
+type Pipe1Regs struct {
+	IPGR1, IPC2R1, IPC2R3 uint32
+	CMCR                  uint32
+	P1FSCR, P1FCTCR       uint32
+	P1SR, P1FCR           uint32
+	P1BLCCR, P1DMCR       uint32
+	P1DECR, P1DCCR        uint32
+	P1DSCR, P1DSRTIOR     uint32
+	P1DSSZR               uint32
+	P1CRSTR, P1CRSZR      uint32
+	P1GMCR                uint32
+	P1YUVCR               uint32
+	P1PPCR                uint32
+	P1PPM0PR              uint32
+	P1PPM0AR1             uint32
 }

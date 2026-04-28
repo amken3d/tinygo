@@ -522,8 +522,10 @@ func handleUSBIRQ(intr interrupt.Interrupt) {
 	//
 	// Always W1C-clear so the IRQ doesn't re-pend.
 	if sts&otgGINTSTS_IISOIXFR != 0 {
+		uvcNIISOIXFR++
 		uvcIISOIXFRSinceXFRC++
 		if uvcIISOIXFRSinceXFRC >= uvcIISOIXFRStuckThreshold {
+			uvcNIISOIXFRRecoveries++
 			handleIISOIXFR()
 			uvcIISOIXFRSinceXFRC = 0
 		}
@@ -531,13 +533,36 @@ func handleUSBIRQ(intr interrupt.Interrupt) {
 	}
 }
 
+// uvcNIISOIXFR counts every IISOIXFR event seen.
+var uvcNIISOIXFR uint32
+
+// uvcNIISOIXFRRecoveries counts how often we've actually triggered the
+// EPDIS+flush recovery path (after 8 consecutive IISOIXFRs without XFRC).
+var uvcNIISOIXFRRecoveries uint32
+
 // uvcIISOIXFRSinceXFRC counts consecutive IISOIXFR events without a
 // successful EP1 XFRC in between. Reset to 0 in handleIEPInt on XFRC.
 // When it crosses uvcIISOIXFRStuckThreshold, we treat the EP as stuck
 // and run the EPDIS-flush-rearm sequence.
 var uvcIISOIXFRSinceXFRC uint32
 
-const uvcIISOIXFRStuckThreshold = 8 // 8 frames = 8 ms of no progress
+// The iso EP intermittently gets stuck waiting for the wrong µframe
+// parity. The OTG core fires IISOIXFR every 1 ms iso frame while the
+// FIFO is non-empty (the *normal* state when streaming at full
+// 512 B/µframe). After enough consecutive IISOIXFRs without an XFRC,
+// we run an EPDIS+EPDISD recovery to kick the EP back into action.
+//
+// Crucial: the EPDISD path used to flush the TX FIFO, which trashed
+// whatever packet was in flight. That cost ~200 of every 302 UVC
+// frame's packets. The current EPDISD handler skips the flush — the
+// already-pushed packet stays in the FIFO and goes out as soon as the
+// EP re-engages with the right parity.
+//
+// Threshold = 8 iso frames (= 8 ms) is the minimum that lets a healthy
+// stream run without false-positive recoveries (XFRCs reset the
+// counter at 8 kHz). Higher values (we tested 1000) leave the EP
+// stalled long enough to lose throughput entirely.
+const uvcIISOIXFRStuckThreshold = 8
 
 // handleIISOIXFR identifies the iso IN endpoint that failed to complete
 // its transfer in the current frame and starts the disable sequence per
@@ -777,15 +802,24 @@ func handleIEPInt() {
 			if ep != 0 {
 				ctl := diepctlReg(ep).Get()
 				if (ctl>>otgEPCTL_EPTYP_Pos)&0x3 == 1 {
-					// Iso EP — flush its TX FIFO so the next push starts
-					// from a clean slate, then ask the tx handler to
-					// queue a new packet.
+					// Iso EP recovery — mirrors ST HAL_PCD's flow:
+					// 1. EPDISD just fired (we asked for EPDIS in the
+					//    IISOIXFR handler). 2. Flush the TX FIFO to
+					//    clear the stuck packet. 3. Re-push the SAME
+					//    packet content (uvcPacket[:uvcLastPacketLen])
+					//    so the data the host was about to receive
+					//    actually gets retransmitted instead of being
+					//    discarded. Calling usbTxHandler[ep]() here
+					//    would build a NEW packet and advance
+					//    uvcFrameOff — that's the bug we used to have
+					//    that caused ~2/3 of every UVC frame to be
+					//    silently dropped.
 					txfnum := (ctl >> otgEPCTL_TXFNUM_Pos) & 0xF
 					otg.GRSTCTL.Set(otgGRSTCTL_TXFFLSH | (txfnum << otgGRSTCTL_TXFNUM_Pos))
 					for otg.GRSTCTL.Get()&otgGRSTCTL_TXFFLSH != 0 {
 					}
-					if usbTxHandler[ep] != nil {
-						usbTxHandler[ep]()
+					if ep == uvcIsoEP {
+						uvcResendLastPacket()
 					}
 				}
 			}
