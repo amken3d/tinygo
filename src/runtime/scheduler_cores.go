@@ -22,8 +22,9 @@ var secondaryCoresStarted bool
 var cpuTasks [numCPU]*task.Task
 
 var (
-	sleepQueue *task.Task
-	runqueue   task.Queue
+	sleepQueue     *task.Task
+	runqueueShared task.Queue         // For unpinned tasks (affinity = -1)
+	runqueueCore   [numCPU]task.Queue // Per-core queues for pinned tasks
 )
 
 func deadlock() {
@@ -39,8 +40,14 @@ func scheduleTask(t *task.Task) {
 	switch t.RunState {
 	case task.RunStatePaused:
 		// Paused, state is saved on the stack.
-		// Add it to the runqueue...
-		runqueue.Push(t)
+		// Add it to the appropriate runqueue based on affinity...
+		if t.Affinity >= 0 && int(t.Affinity) < numCPU {
+			// Pinned to a specific core
+			runqueueCore[t.Affinity].Push(t)
+		} else {
+			// Unpinned, use shared queue
+			runqueueShared.Push(t)
+		}
 		// ...and wake up a sleeping core, if there is one.
 		// (If all cores are already busy, this is a no-op).
 		schedulerWake()
@@ -86,7 +93,13 @@ func addSleepTask(t *task.Task, wakeup timeUnit) {
 
 func Gosched() {
 	schedulerLock.Lock()
-	runqueue.Push(task.Current())
+	t := task.Current()
+	// Push to the appropriate queue based on affinity
+	if t.Affinity >= 0 && int(t.Affinity) < numCPU {
+		runqueueCore[t.Affinity].Push(t)
+	} else {
+		runqueueShared.Push(t)
+	}
 	task.PauseLocked()
 }
 
@@ -110,7 +123,7 @@ func removeTimer(t *timer) *timerNode {
 }
 
 func schedulerRunQueue() *task.Queue {
-	return &runqueue
+	return &runqueueShared
 }
 
 // Pause the current task for a given time.
@@ -130,6 +143,43 @@ func sleep(duration int64) {
 	schedulerLock.Lock()
 	addSleepTask(task.Current(), wakeup)
 	task.PauseLocked()
+}
+
+// machineLockCore pins the calling goroutine to the specified CPU core.
+// It sets the affinity and yields repeatedly until the goroutine is actually
+// running on the target core. This ensures that when the function returns,
+// the caller is guaranteed to be executing on the requested core.
+//
+// This function is called from machine.LockCore via go:linkname.
+func machineLockCore(core int) {
+	// Set affinity while holding the scheduler lock
+	schedulerLock.Lock()
+	t := task.Current()
+	if t != nil {
+		t.Affinity = int8(core)
+	}
+	schedulerLock.Unlock()
+
+	// Yield repeatedly until we're actually on the target core.
+	// This loop is necessary because:
+	// 1. The task might be running on a different core when LockCore is called
+	// 2. The target core might be busy with other work
+	// 3. We need to guarantee execution on the target core before returning
+	for int(currentCPU()) != core {
+		Gosched()
+	}
+}
+
+// machineUnlockCore unpins the calling goroutine, allowing it to run on any core.
+//
+// This function is called from machine.UnlockCore via go:linkname.
+func machineUnlockCore() {
+	schedulerLock.Lock()
+	t := task.Current()
+	if t != nil {
+		t.Affinity = -1 // unpinned
+	}
+	schedulerLock.Unlock()
 }
 
 // This function is called on the first core in the system. It will wake up the
@@ -161,9 +211,20 @@ func run() {
 }
 
 func scheduler(_ bool) {
+	currentCore := int(currentCPU())
 	for mainExited.Load() == 0 {
 		// Check for ready-to-run tasks.
-		if runnable := runqueue.Pop(); runnable != nil {
+		// First check this core's dedicated queue (for pinned tasks).
+		var runnable *task.Task
+		if currentCore < numCPU {
+			runnable = runqueueCore[currentCore].Pop()
+		}
+		// If no pinned task, check the shared queue.
+		if runnable == nil {
+			runnable = runqueueShared.Pop()
+		}
+
+		if runnable != nil {
 			// Resume it now.
 			setCurrentTask(runnable)
 			runnable.RunState = task.RunStateRunning
@@ -184,7 +245,16 @@ func scheduler(_ bool) {
 				sleepQueue = sleepQueue.Next
 				sleepingTask.Next = nil
 
-				// Run it now.
+				// Check if this task can run on the current core.
+				if sleepingTask.Affinity >= 0 && int(sleepingTask.Affinity) != currentCore {
+					// Task is pinned to a different core, add it to that core's queue.
+					sleepingTask.RunState = task.RunStatePaused
+					runqueueCore[sleepingTask.Affinity].Push(sleepingTask)
+					schedulerWake() // Wake the target core if it's sleeping
+					continue
+				}
+
+				// Run it now on this core.
 				setCurrentTask(sleepingTask)
 				sleepingTask.RunState = task.RunStateRunning
 				schedulerLock.Unlock() // unlock before resuming, Pause() will lock again
@@ -287,6 +357,19 @@ func lockAtomics() interrupt.State {
 func unlockAtomics(mask interrupt.State) {
 	atomicsLock.Unlock()
 	interrupt.Restore(mask)
+}
+
+// lockOSThreadImpl pins the calling goroutine to its current CPU core.
+// This is called from runtime.LockOSThread.
+func lockOSThreadImpl() {
+	// Pin to whichever core we're currently running on
+	machineLockCore(int(currentCPU()))
+}
+
+// unlockOSThreadImpl unpins the calling goroutine.
+// This is called from runtime.UnlockOSThread.
+func unlockOSThreadImpl() {
+	machineUnlockCore()
 }
 
 var systemStack [numCPU]uintptr

@@ -92,3 +92,11 @@ func printlock() {
 func printunlock() {
 	// nothing to do
 }
+
+func lockOSThreadImpl() {
+	// no-op: no scheduler means no parallelism
+}
+
+func unlockOSThreadImpl() {
+	// no-op: no scheduler means no parallelism
+}

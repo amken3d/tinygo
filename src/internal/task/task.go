@@ -30,6 +30,11 @@ type Task struct {
 	// since it falls into the padding of the FipsIndicator bit above.
 	RunState uint8
 
+	// Affinity indicates which CPU core this task is pinned to.
+	// -1 means unpinned (can run on any core), 0+ means pinned to that core.
+	// Only used with scheduler.cores.
+	Affinity int8
+
 	// DeferFrame stores a pointer to the (stack allocated) defer frame of the
 	// goroutine that is used for the recover builtin.
 	DeferFrame unsafe.Pointer

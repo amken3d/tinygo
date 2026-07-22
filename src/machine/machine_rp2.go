@@ -139,3 +139,75 @@ func u32max(a, b uint32) uint32 {
 func isReservedI2CAddr(addr uint8) bool {
 	return (addr&0x78) == 0 || (addr&0x78) == 0x78
 }
+
+// LockCore pins the calling goroutine to the specified CPU core (0 or 1).
+//
+// This function guarantees that when it returns, the goroutine is actually
+// executing on the requested core. It yields internally until the migration
+// completes, which means it may block if the target core is busy.
+//
+// # Blocking Behavior
+//
+// LockCore will loop and yield until the goroutine successfully migrates to
+// the target core. If the target core is occupied by long-running work, this
+// may take significant time. For best results:
+//
+//   - Pin goroutines early, ideally during initialization
+//   - Ensure pinned goroutines yield periodically (e.g., via channel operations,
+//     time.Sleep, or runtime.Gosched)
+//   - Avoid having one goroutine monopolize a core indefinitely
+//
+// # Usage Patterns
+//
+// Static pinning (recommended):
+//
+//	func main() {
+//	    machine.LockCore(0)  // Main runs on core 0
+//
+//	    go func() {
+//	        machine.LockCore(1)  // Worker runs on core 1
+//	        stepGenerationLoop()
+//	    }()
+//	}
+//
+// Dynamic pinning (advanced):
+//
+//	go func() {
+//	    machine.LockCore(1)  // Pin to core 1 for time-critical work
+//	    doTimeCriticalWork()
+//	    machine.UnlockCore() // Release core
+//	}()
+//
+// # Use Cases
+//
+//   - Motion control: Pin step generation to core 1 for deterministic timing
+//   - Real-time processing: Dedicate one core to time-critical tasks
+//   - Resource partitioning: Separate concerns across cores (e.g., I/O on core 0,
+//     computation on core 1)
+//
+// # Availability
+//
+// This function is only available when building with -scheduler=cores for
+// RP2040 or RP2350 targets. On other schedulers or targets, calling LockCore
+// will panic.
+//
+// For portable code that works across schedulers, use runtime.LockOSThread
+// instead, which pins to the current core on RP2040/RP2350 with scheduler.cores,
+// and is a no-op elsewhere.
+func LockCore(core int)
+
+// UnlockCore unpins the calling goroutine, allowing it to be scheduled on any
+// available CPU core.
+//
+// If the goroutine was not previously pinned via LockCore or runtime.LockOSThread,
+// this is a no-op.
+//
+// After calling UnlockCore, the goroutine may migrate to a different core at
+// the next scheduling point (channel operation, time.Sleep, runtime.Gosched, etc.).
+//
+// # Availability
+//
+// This function is only available when building with -scheduler=cores for
+// RP2040 or RP2350 targets. On other schedulers or targets, calling UnlockCore
+// will panic.
+func UnlockCore()

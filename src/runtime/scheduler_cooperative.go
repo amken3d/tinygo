@@ -268,3 +268,11 @@ func printlock() {
 func printunlock() {
 	// nothing to do
 }
+
+func lockOSThreadImpl() {
+	// no-op: cooperative scheduler has no parallelism
+}
+
+func unlockOSThreadImpl() {
+	// no-op: cooperative scheduler has no parallelism
+}

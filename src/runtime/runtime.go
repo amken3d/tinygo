@@ -98,14 +98,30 @@ func os_sigpipe() {
 }
 
 // LockOSThread wires the calling goroutine to its current operating system thread.
-// Stub for now
-// Called by go1.18 standard library on windows, see https://github.com/golang/go/issues/49320
+//
+// With the "cores" scheduler on RP2040/RP2350, this pins the goroutine to the
+// CPU core it's currently running on. The goroutine will remain on that core
+// until UnlockOSThread is called. The pinning guarantees take effect before
+// LockOSThread returns - the function yields internally until the goroutine is
+// actually executing on the pinned core.
+//
+// On other schedulers (cooperative, threads, none), this is a no-op since they
+// don't support core affinity.
+//
+// A goroutine should call LockOSThread before calling OS services or non-Go
+// library functions that depend on per-thread state.
 func LockOSThread() {
+	lockOSThreadImpl()
 }
 
 // UnlockOSThread undoes an earlier call to LockOSThread.
-// Stub for now
+//
+// If the calling goroutine has not called LockOSThread, UnlockOSThread is a no-op.
+//
+// With the "cores" scheduler, this unpins the goroutine, allowing it to be
+// scheduled on any available core.
 func UnlockOSThread() {
+	unlockOSThreadImpl()
 }
 
 // KeepAlive makes sure the value in the interface is alive until at least the

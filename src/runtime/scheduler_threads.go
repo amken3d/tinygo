@@ -158,3 +158,12 @@ func lockAtomics() interrupt.State {
 func unlockAtomics(mask interrupt.State) {
 	atomicsLock.Unlock()
 }
+
+func lockOSThreadImpl() {
+	// TODO: could potentially use pthread_setaffinity_np or similar
+	// For now, no-op since threads scheduler uses OS threads
+}
+
+func unlockOSThreadImpl() {
+	// no-op: threads scheduler uses OS threads
+}
